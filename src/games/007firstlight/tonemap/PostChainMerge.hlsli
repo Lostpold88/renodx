@@ -18,10 +18,83 @@ void CalculateFilmTonemapHDRHeadroom(inout float hdr_scale, inout float hdr_head
   }
 }
 
+// Szenen-Mittelgrau am Eingang der Tonwertkurve. Entspricht dem Drehpunkt,
+// den die Film-Kurve in ApplyFilmToneMapExtended selbst verwendet.
+static const float PSYCHOV22_SCENE_MID_GRAY = 0.18f;
+
+// Zielmarke, die die Endstufe von der Nutzer-Spitzenhelligkeit erreichen soll.
+static const float PSYCHOV22_DISPLAY_MAP_TARGET = 0.97f;
+
+// Die Abbildung auf die Nutzer-Spitzenhelligkeit macht erst
+// neutwo::MaxChannel in FinalizeOutput, und neutwo naehert sich seiner Spitze
+// nur asymptotisch. Wer dieser Stufe ein bereits auf die Spitze gekapptes
+// Signal liefert, landet zwangslaeufig deutlich darunter.
+//
+// Der RenoDX-Pfad hat die noetige Reserve automatisch, weil er die ungekappte
+// Film-Kurve durchreicht. PsychoV-22 muss sie ausrechnen: die exakte Reserve
+// ist die Umkehrfunktion der Endstufe an der Zielmarke, also
+//   inverse::Neutwo(0.97 * P, P) ~= 4 * P.
+//
+// ApplyToneMap arbeitet noch vor der Weisspunkt-Normalisierung durch
+// fRcpMappedWhitePoint, die Endstufe dahinter. Deshalb zurueckrechnen, damit
+// beide Groessen im selben Wertebereich liegen.
+float ComputePsychoV22WorkingPeak() {
+  float display_peak = RENODX_PEAK_WHITE_NITS / RENODX_DIFFUSE_WHITE_NITS;
+
+  float required_input = renodx::tonemap::inverse::Neutwo(
+      PSYCHOV22_DISPLAY_MAP_TARGET * display_peak,
+      display_peak);
+
+  return renodx::math::DivideSafe(
+      required_input,
+      cbPostChainMerge.fRcpMappedWhitePoint,
+      required_input);
+}
+
+// PsychoV-22 ersetzt ausschliesslich die Tonwertkurve. Belichtung, Kontrast,
+// Saettigung und die uebrigen Regler sitzen in dieser Mod erst hinter dem LUT
+// in ApplyCustomGrading und bleiben deshalb neutral (1.0) uebergeben, sonst
+// wuerde doppelt gegradet.
+//
+// anchor_out und peak muessen beide im Wertebereich der jeweiligen
+// Vanilla-Kurve liegen, nicht im Szenenbereich: LUT-Abtastung, Vignette und
+// das nachgelagerte Grading sind darauf ausgelegt.
+//
+// Wichtig: peak ist hier NICHT die Nutzer-Spitzenhelligkeit, sondern der
+// Arbeitsbereich mit Reserve -- siehe ComputePsychoV22WorkingPeak().
+float3 ApplyPsychoV22(float3 untonemapped, float anchor_out, float peak) {
+  return renodx::tonemap::psychov::psychotm_test22(
+      untonemapped,
+      peak,
+      1.f,    // Belichtung (nachgelagert)
+      1.f,    // Lichter (nachgelagert)
+      1.f,    // Schatten (nachgelagert)
+      1.f,    // Kontrast (nachgelagert)
+      1.f,    // Farbreinheit (nachgelagert)
+      1.f,    // Ausbleichen (reserviert)
+      100.f,  // Clip-Punkt (reserviert)
+      1.f,    // Farbtonwiederherstellung (reserviert)
+      1.f,    // Adaptionskontrast (veraltet)
+      0,      // Weisskurvenmodus (veraltet)
+      RENODX_TONE_MAP_CONE_RESPONSE,
+      PSYCHOV22_SCENE_MID_GRAY.xxx,  // Anker-Eingang: Szenen-Mittelgrau
+      anchor_out.xxx,                // Anker-Ausgang: Mittelgrau der Vanilla-Kurve
+      1.f,                           // Gamut-Kompression
+      0,                             // BT.709-Huelle: die Kette ist hier BT.709
+      1.f,                           // Adaptive Normalisierung (veraltet)
+      0.f);                          // 0 = automatische Kompression
+}
+
 float3 ApplyToneMap(float3 untonemapped, float film_white_clip) {
   float3 tonemapped;
 #if POSTCHAINMERGE_TONEMAP_TYPE == POSTCHAINMERGE_TONEMAP_NONE
-  if (TONE_MAP_TYPE != 0.f) {
+  if (TONE_MAP_TYPE == FIRSTLIGHT_TONE_MAP_TYPE_PSYCHOV22) {
+    // Ohne Vanilla-Kurve bleibt das Mittelgrau unveraendert.
+    tonemapped = ApplyPsychoV22(
+        untonemapped,
+        PSYCHOV22_SCENE_MID_GRAY,
+        ComputePsychoV22WorkingPeak());
+  } else if (TONE_MAP_TYPE != 0.f) {
     float3 hue_and_purity_reference = renodx::tonemap::neutwo::PerChannel(untonemapped, RENODX_PEAK_WHITE_NITS / RENODX_DIFFUSE_WHITE_NITS);
 
     tonemapped = renodx::color::correct::Luminance(hue_and_purity_reference, renodx::color::yf::from::BT709(hue_and_purity_reference), renodx::color::yf::from::BT709(untonemapped));
@@ -34,7 +107,16 @@ float3 ApplyToneMap(float3 untonemapped, float film_white_clip) {
   tonemapped = renodx::tonemap::ApplyCurve(untonemapped, 0.6f, 1.f, 0.1f, 1.f, 0.004f, 0.06f);
 #elif POSTCHAINMERGE_TONEMAP_TYPE == POSTCHAINMERGE_TONEMAP_FILM
 
-  if (TONE_MAP_TYPE != 0.f) {
+  if (TONE_MAP_TYPE == FIRSTLIGHT_TONE_MAP_TYPE_PSYCHOV22) {
+    FilmTonemapConfig film_tonemap_config = CreateFilmTonemapConfig(100.f);
+
+    // Anker-Ausgang aus der Film-Kurve, damit LUT und Grading ihren
+    // Arbeitspunkt behalten: die Kurve bildet 0.18 nicht auf 0.18 ab.
+    tonemapped = ApplyPsychoV22(
+        untonemapped,
+        ApplyFilmToneMap(PSYCHOV22_SCENE_MID_GRAY, film_tonemap_config),
+        ComputePsychoV22WorkingPeak());
+  } else if (TONE_MAP_TYPE != 0.f) {
     FilmTonemapConfig film_tonemap_config = CreateFilmTonemapConfig(100.f);
     const float sdr_blend_strength = 0.88f;
 

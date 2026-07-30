@@ -1,5 +1,8 @@
 #include "../common.hlsli"
 
+// Nicht Teil der Standard-Include-Kette von renodx.hlsl.
+#include "../../../shaders/tonemap/psychov/test22.hlsl"
+
 #define LMS_WHITE_BT709  renodx::color::lms::from::BT709(1.0f)
 #define LMS_WHITE_BT2020 renodx::color::lms::from::BT2020(1.0f)
 

@@ -3,14 +3,15 @@
 
 #define USE_EXPENSIVE_LUT_GAMUT_RESTORATION 0
 
-// Must be 32bit aligned
-// Should be 4x32
+// Muss 32-Bit-ausgerichtet sein
+// Sollte 4x32 sein
 struct ShaderInjectData {
   float tone_map_type;
   float peak_white_nits;
   float diffuse_white_nits;
   float graphics_white_nits;
   float tone_map_scaling;
+  float tone_map_cone_response;
 
   float tone_map_exposure;
   float tone_map_highlights;
@@ -32,7 +33,6 @@ struct ShaderInjectData {
 
   float custom_ssr_reflection_fix;
   float custom_shadow_reserved_1;
-  float custom_shadow_reserved_2;
 };
 
 #ifndef __cplusplus
@@ -45,7 +45,15 @@ cbuffer cb13 : register(b0, space50) {
 #define RENODX_DIFFUSE_WHITE_NITS  shader_injection.diffuse_white_nits
 #define RENODX_GRAPHICS_WHITE_NITS shader_injection.graphics_white_nits
 
-#define RENODX_TONE_MAP_SCALING shader_injection.tone_map_scaling
+// TONE_MAP_TYPE ist zugleich der Hauptschalter der RenoDX-Kette: 0 = Vanilla,
+// jeder Wert != 0 aktiviert den RenoDX-Pfad und waehlt dabei die Tonwertkurve
+// (1 = RenoDX, 2 = PsychoV-22).
+// Der Praefix ist noetig, weil shaders/draw.hlsl bereits eigene
+// TONE_MAP_TYPE_*-Konstanten deklariert.
+#define FIRSTLIGHT_TONE_MAP_TYPE_PSYCHOV22 2.f
+
+#define RENODX_TONE_MAP_SCALING       shader_injection.tone_map_scaling
+#define RENODX_TONE_MAP_CONE_RESPONSE shader_injection.tone_map_cone_response
 
 #define RENODX_TONE_MAP_EXPOSURE             shader_injection.tone_map_exposure
 #define RENODX_TONE_MAP_HIGHLIGHTS           shader_injection.tone_map_highlights

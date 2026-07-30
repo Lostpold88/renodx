@@ -38,7 +38,7 @@ inline void AppendSettings(renodx::utils::settings::Settings& settings) {
 
   settings.insert(
       std::find_if(settings.begin(), settings.end(), [](const renodx::utils::settings::Setting* setting) {
-        return setting != nullptr && setting->section == "Options";
+        return setting != nullptr && setting->section == "Optionen";
       }),
       {
           new renodx::utils::settings::Setting{
@@ -46,10 +46,12 @@ inline void AppendSettings(renodx::utils::settings::Settings& settings) {
               .binding = &dlssg_hud_ghosting_fix,
               .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
               .default_value = 1.f,
-              .label = "DLSS FG HUD Ghosting Fix",
+              .label = "DLSS-FG-HUD-Ghosting-Korrektur",
               .section = "DLSS Frame Generation",
-              .tooltip = "Hides the game's broken UI alpha and HUD-less color inputs from DLSS Frame Generation to reduce HUD ghosting and disocclusion artifacts.",
-              .labels = {"Off", "On"},
+              .tooltip = "Blendet die fehlerhaften UI-Alpha- und HUD-losen Farbeingaben des Spiels"
+                         "\nvor DLSS Frame Generation aus und reduziert so HUD-Ghosting und"
+                         "\nDisocclusion-Artefakte.",
+              .labels = {"Aus", "Ein"},
           },
       });
 }
