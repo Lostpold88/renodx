@@ -223,8 +223,12 @@ renodx::utils::settings::Settings settings = {
         .default_value = 100.f,
         .label = "LUT-Stärke",
         .section = "Farbkorrektur",
+        .tooltip = "Stärke des spieleigenen Farbkorrektur-LUT."
+                   "\nPsychoV-22 umgeht den LUT vollständig, damit er dessen"
+                   "\nFarbton- und Reinheitsentscheidungen nicht überschreibt"
+                   "\nund nichts außerhalb BT.709 abgeschnitten wird.",
         .max = 100.f,
-        .is_enabled = []() { return IsToneMapped(); },
+        .is_enabled = []() { return IsToneMapped() && !IsPsychoV22(); },
         .parse = [](float value) { return value * 0.01f; },
     },
     new renodx::utils::settings::Setting{

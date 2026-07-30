@@ -160,6 +160,20 @@ float3 ApplyVignetteWhitePointAndVerticalFade(float3 color, float4 grid) {
 }
 
 float3 SampleSRGBColorCorrectionLUT(float3 color, float hdr_scale, float hdr_headroom) {
+  // PsychoV-22 umgeht den Farbkorrektur-LUT des Spiels vollstaendig. Der LUT
+  // ist ein sRGB-Volumen: seine Eingabe wird auf [0,1] geklemmt und seine
+  // Ausgabe liegt konstruktionsbedingt in BT.709. Er wuerde die Farbton- und
+  // Reinheitsentscheidungen der Kurve teilweise ueberschreiben und alles
+  // ausserhalb BT.709 abschneiden.
+  //
+  // Nur sRGB-kodieren, denn FinalizeOutput dekodiert als Erstes wieder.
+  // Bewusst ohne max(0, ...): EncodeSafe/DecodeSafe sind vorzeichenerhaltend,
+  // damit ueberleben Auslenkungen ausserhalb BT.709 den Umweg. Geklemmt wird
+  // erst spaeter in BT.2020, wo weniger verloren geht.
+  if (TONE_MAP_TYPE == FIRSTLIGHT_TONE_MAP_TYPE_PSYCHOV22) {
+    return renodx::color::srgb::EncodeSafe(color);
+  }
+
   if (TONE_MAP_TYPE != 0.f) {
     float3 adaptive_state_lms;
     float gamut_compression_scale;
