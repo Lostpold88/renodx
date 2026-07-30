@@ -34,7 +34,7 @@ renodx::utils::settings::Settings settings = {
         .label = "Tone Mapper",
         .section = "Tone Mapping",
         .tooltip = "Sets the tone mapper type",
-        .labels = {"Vanilla", "ACES"},
+        .labels = {"Vanilla", "ACES", "PsychoV-22"},
     },
     new renodx::utils::settings::Setting{
         .key = "ToneMapPeakNits",
@@ -58,9 +58,10 @@ renodx::utils::settings::Settings settings = {
         .tooltip = "Selects the ACES mid-gray target:\n"
                    "4.8 is ACES reference behavior.\n"
                    "10.0 matches the SDR tonemapper [RRT + ODT.Academy.RGBmonitor_100nits_dim / ODT.Academy.Rec709_100nits_dim].\n"
-                   "15.0 matches the HDR tonemapper [RRTODT.Academy.Rec2020_1000nits_15nits_ST2084].",
+                   "15.0 matches the HDR tonemapper [RRTODT.Academy.Rec2020_1000nits_15nits_ST2084].\n"
+                   "Not used by PsychoV-22, which anchors mid gray on its own.",
         .labels = {"4.8 (Reference ACES)", "10.0 (Matches SDR)", "15.0 (Matches HDR)"},
-        .is_enabled = []() { return shader_injection.tone_map_type != 0; },
+        .is_enabled = []() { return shader_injection.tone_map_type == 1.f; },
     },
     new renodx::utils::settings::Setting{
         .key = "ToneMapGameNits",
@@ -80,7 +81,8 @@ renodx::utils::settings::Settings settings = {
         .default_value = 2.f,
         .label = "SDR EOTF Emulation",
         .section = "Tone Mapping",
-        .tooltip = "Emulates a 2.2 EOTF",
+        .tooltip = "Emulates a 2.2 EOTF.\n"
+                   "PsychoV-22 has no ACES toe to lower, so `Lower ACES Min Nits` acts as `Off` there.",
         .labels = {"Off", "2.2", "Lower ACES Min Nits"},
         .is_enabled = []() { return shader_injection.tone_map_type != 0; },
     },
@@ -93,7 +95,22 @@ renodx::utils::settings::Settings settings = {
         .section = "Tone Mapping",
         .tooltip = "Luminance scales colors consistently while per channel matches the original behavior of the tonemapper",
         .labels = {"Luminance", "Per Channel"},
-        .is_enabled = []() { return shader_injection.tone_map_type != 0.f; },
+        .is_enabled = []() { return shader_injection.tone_map_type == 1.f; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "ToneMapConeResponse",
+        .binding = &shader_injection.tone_map_cone_response,
+        .default_value = 67.f,
+        .label = "Cone Response",
+        .section = "Tone Mapping",
+        .tooltip = "Controls the cone response shaping of PsychoV-22.\n"
+                   "Scales the contrast and purity of the tone curve together and is,\n"
+                   "with the other controls neutral, the log-log slope of the curve at mid gray.\n"
+                   "67 matches the slope of the ACES curve, 50 is a mathematically flat curve.\n"
+                   "Only available with PsychoV-22.",
+        .max = 100.f,
+        .is_enabled = []() { return shader_injection.tone_map_type == 2.f; },
+        .parse = [](float value) { return value * 0.02f; },
     },
     new renodx::utils::settings::Setting{
         .key = "ToneMapUINits",
@@ -429,6 +446,7 @@ void OnPresetOff() {
       {"ToneMapUINits", 203.f},
       {"ToneMapACESMidGray", 2.f},
       {"ToneMapScaling", 1.f},
+      {"ToneMapConeResponse", 67.f},
       {"EOTFEmulation", 0.f},
       {"UIEOTFEmulation", 0.f},
       {"UIVisibility", 1.f},

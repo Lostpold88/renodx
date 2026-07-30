@@ -23,6 +23,7 @@ struct ShaderInjectData {
   float diffuse_white_nits;
   float graphics_white_nits;
   float tone_map_scaling;
+  float tone_map_cone_response;
   float custom_ui_visibility;
 
   float tone_map_exposure;
@@ -59,7 +60,14 @@ cbuffer cb13 : register(b0, space50) {
 #define RENODX_GRAPHICS_WHITE_NITS shader_injection.graphics_white_nits
 #define CUSTOM_SHOW_UI             shader_injection.custom_ui_visibility
 
+// TONE_MAP_TYPE is also the master switch of the RenoDX chain: 0 = Vanilla, any
+// non-zero value enables the RenoDX path and only selects the tone curve
+// (1 = ACES, 2 = PsychoV-22). The prefix is needed because shaders/draw.hlsl
+// already declares its own TONE_MAP_TYPE_* constants.
+#define RE9REQUIEM_TONE_MAP_TYPE_PSYCHOV22 2.f
+
 #define RENODX_TONE_MAP_SCALING       shader_injection.tone_map_scaling
+#define RENODX_TONE_MAP_CONE_RESPONSE shader_injection.tone_map_cone_response
 #define RENODX_TONE_MAP_HUE_RETENTION 0.f
 #define RENODX_GAMMA_CORRECTION       shader_injection.gamma_correction
 #define RENODX_GAMMA_CORRECTION_UI    shader_injection.gamma_correction_ui
