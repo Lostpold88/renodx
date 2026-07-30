@@ -80,7 +80,12 @@ float3 ApplyPsychoV22(float3 untonemapped, float anchor_out, float peak) {
       PSYCHOV22_SCENE_MID_GRAY.xxx,  // Anker-Eingang: Szenen-Mittelgrau
       anchor_out.xxx,                // Anker-Ausgang: Mittelgrau der Vanilla-Kurve
       1.f,                           // Gamut-Kompression
-      0,                             // BT.709-Huelle: die Kette ist hier BT.709
+      // BT.2020-Huelle statt BT.709. Der Farbkorrektur-LUT, der alles
+      // ausserhalb BT.709 abgeschnitten haette, wird bei PsychoV-22 umgangen,
+      // und die Ausgabe ist ohnehin BT.2020. Farben ausserhalb BT.709
+      // erscheinen dabei als negative BT.709-Werte; alle Stufen bis zur
+      // BT.2020-Konvertierung in FinalizeOutput sind vorzeichenerhaltend.
+      1,
       1.f,                           // Adaptive Normalisierung (veraltet)
       0.f);                          // 0 = automatische Kompression
 }
