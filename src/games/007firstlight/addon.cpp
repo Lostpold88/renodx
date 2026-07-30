@@ -93,7 +93,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
         .key = "ToneMapConeResponse",
         .binding = &shader_injection.tone_map_cone_response,
-        .default_value = 60.f,
+        .default_value = 70.f,
         .label = "Zapfenantwort",
         .section = "Tonemapping",
         .tooltip = "Steuert die Zapfenantwort-Formung von PsychoV-22."
@@ -378,7 +378,7 @@ void OnPresetOff() {
       {"ToneMapGameNits", 203.f},
       {"ToneMapUINits", 203.f},
       {"ToneMapScaling", 1.f},
-      {"ToneMapConeResponse", 60.f},
+      {"ToneMapConeResponse", 70.f},
       {"ColorGradeExposure", 1.f},
       {"ColorGradeHighlights", 50.f},
       {"ColorGradeHighlightContrast", 50.f},
