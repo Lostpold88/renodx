@@ -82,9 +82,9 @@ renodx::utils::settings::Settings settings = {
         .label = "SDR EOTF Emulation",
         .section = "Tone Mapping",
         .tooltip = "Emulates a 2.2 EOTF.\n"
-                   "PsychoV-22 has no ACES toe to lower, so `Lower ACES Min Nits` acts as `Off` there.",
+                   "PsychoV-22 is pinned to 2.2 and applies it on luminance, so it keeps its blacks without losing gamut.",
         .labels = {"Off", "2.2", "Lower ACES Min Nits"},
-        .is_enabled = []() { return shader_injection.tone_map_type != 0; },
+        .is_enabled = []() { return shader_injection.tone_map_type == 1.f; },
     },
     new renodx::utils::settings::Setting{
         .key = "ToneMapScaling",

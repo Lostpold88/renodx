@@ -511,14 +511,16 @@ float3 ApplyToneMapEncodePQ(float3 untonemapped_ap1, float cbuffer_peak_nits, fl
     //
     // None of the ACES scaffolding is built here: PsychoV-22 anchors mid gray on
     // its own and reaches its peak asymptotically, so it needs neither the
-    // exp-shift system nor an ACES min/black level. `SDR EOTF Emulation` therefore
-    // only distinguishes Off and 2.2 on this path; `Lower ACES Min Nits` has no
-    // ACES toe left to lower and behaves like Off.
-    float display_peak = RENODX_PEAK_WHITE_NITS / RENODX_DIFFUSE_WHITE_NITS;
-    if (RENODX_GAMMA_CORRECTION == 1.f) {
-      // Pre-correct so the peak lands back on the user setting after GammaSafe.
-      display_peak = renodx::color::correct::Gamma(display_peak, true);
-    }
+    // exp-shift system nor an ACES min/black level.
+    //
+    // The 2.2 EOTF emulation is not optional on this path, it is part of the
+    // rendering. PsychoV-22 keeps a near constant log-log slope down into the
+    // shadows instead of bending into a toe the way the ACES SSTS does, so
+    // without the emulation the blacks stay lifted and the image reads milky.
+    // `SDR EOTF Emulation` is therefore pinned to 2.2 here and greyed out in the
+    // UI. The peak is pre-corrected so it lands back on the user setting after
+    // the correction below.
+    float display_peak = renodx::color::correct::Gamma(RENODX_PEAK_WHITE_NITS / RENODX_DIFFUSE_WHITE_NITS, true);
 
     float3 tonemapped_bt709 = renodx::tonemap::psychov::psychotm_test22(
         renodx::color::bt709::from::AP1(untonemapped_ap1),
@@ -540,15 +542,38 @@ float3 ApplyToneMapEncodePQ(float3 untonemapped_ap1, float cbuffer_peak_nits, fl
         // BT.2020 hull instead of BT.709. In-hull colors pass the compression
         // untouched, only colors outside BT.2020 are rolled onto the hull, so the
         // full BT.2020 output volume stays available. Colors outside BT.709 leave
-        // the curve as negative BT.709 values; every stage up to the BT.2020
-        // conversion below preserves sign (GammaSafe).
+        // the curve as negative BT.709 values and stay that way until the BT.2020
+        // conversion below.
         1,
         1.f,   // adaptive normalization (deprecated)
         0.f);  // 0 = automatic compression
 
-    if (RENODX_GAMMA_CORRECTION == 1.f) {
-      tonemapped_bt709 = renodx::color::correct::GammaSafe(tonemapped_bt709);
-    }
+    // EOTF emulation on luminance, not per channel.
+    //
+    // Per-channel GammaSafe runs a nonlinear curve on each BT.709 component
+    // separately, so it changes the ratios between them. For a color outside
+    // BT.709 those ratios are exactly what carries the wide gamut, because the
+    // out-of-hull part lives in the negative components. The curve's gain is
+    // strongly level dependent - roughly 0.63x at 0.01, 0.99x at 0.1 and 1.02x at
+    // 0.2 - so a dim saturated color has its small and its large components scaled
+    // by very different factors and gets pulled toward the neutral axis.
+    //
+    // Measured: BT.2020 (0, 0.2, 0) is BT.709 (-0.1175, +0.2266, -0.0201). Per
+    // channel that comes back as BT.2020 (+0.0017, +0.2038, +0.0041) - both
+    // negative excursions have flipped positive, so the color has left the hull
+    // toward the interior, a shift of 0.029 in BT.2020 rg chromaticity. The effect
+    // is worst at low levels, which is where this game spends most of its frame.
+    //
+    // Scaling by a luminance ratio is one scalar per pixel, so chromaticity is
+    // untouched (measured shift: 0.000) and the color stays on its BT.2020 hull
+    // ray. For neutrals both variants agree to within 1e-13, so the shadow crush
+    // and the midtone placement are unchanged - only chromatic pixels keep their
+    // purity.
+    float y_in = renodx::color::yf::from::BT709(tonemapped_bt709);
+    tonemapped_bt709 = renodx::color::correct::Luminance(
+        tonemapped_bt709,
+        y_in,
+        renodx::color::correct::Gamma(max(0.f, y_in)));
 
     // `Scaling` is not applied here: PsychoV-22 solves luminance, purity and hue
     // together in LMS instead of blending a per channel and a luminance curve.
