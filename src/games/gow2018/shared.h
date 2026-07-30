@@ -16,8 +16,8 @@
 // #define RENODX_USE_PQ_ENCODING      1u
 // #define RENODX_OVERRIDE_BRIGHTNESS  1u
 
-// Must be 32bit aligned
-// Should be 4x32
+// Muss 32-Bit-ausgerichtet sein
+// Sollte 4x32 sein
 struct ShaderInjectData {
   float peak_white_nits;
   float diffuse_white_nits;
@@ -35,6 +35,7 @@ struct ShaderInjectData {
   float gamma_correction;
   float tone_map_override_brightness;
   float custom_hdr10_encoding;
+  float tone_map_cone_response;
 };
 
 #ifndef __cplusplus
@@ -58,8 +59,15 @@ cbuffer cb11 : register(b11) {
 #define RENODX_TONE_MAP_HUE_SHIFT            shader_injection.tone_map_hue_shift
 #define RENODX_USE_PQ_ENCODING               shader_injection.custom_hdr10_encoding
 #define RENODX_OVERRIDE_BRIGHTNESS           shader_injection.tone_map_override_brightness
+#define RENODX_TONE_MAP_CONE_RESPONSE        shader_injection.tone_map_cone_response
+
+// Tonemapper-Auswahl fuer RENODX_TONE_MAP_TYPE.
+#define RENODX_TONE_MAP_TYPE_VANILLA   0.f
+#define RENODX_TONE_MAP_TYPE_NEUTWO    1.f
+#define RENODX_TONE_MAP_TYPE_PSYCHOV22 2.f
 
 #include "../../shaders/renodx.hlsl"
+#include "../../shaders/tonemap/psychov/test22.hlsl"
 
 #endif
 

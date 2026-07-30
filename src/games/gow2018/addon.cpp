@@ -22,13 +22,35 @@
 namespace {
 
 renodx::mods::shader::CustomShaders custom_shaders = {
-    CustomShaderEntry(0xF4EFA04D),  // Tonemap + PQ w/ TAA
-    CustomShaderEntry(0x279D11F6),  // Tonemap + PQ w/ DLSS/FSR
+    CustomShaderEntry(0xF4EFA04D),  // Tonemapping + PQ mit TAA
+    CustomShaderEntry(0x279D11F6),  // Tonemapping + PQ mit DLSS/FSR
 
-    CustomShaderEntry(0x8A2543B3),  // Calibration Menu
+    CustomShaderEntry(0x8A2543B3),  // Kalibrierungsmenue
 };
 
 ShaderInjectData shader_injection;
+
+constexpr float TONE_MAP_TYPE_NEUTWO = 1.f;
+constexpr float TONE_MAP_TYPE_PSYCHOV22 = 2.f;
+
+// Sichtbarkeit der Regler haengt vom gewaehlten Tonemapper ab.
+bool IsToneMapped() { return shader_injection.tone_map_type != 0.f; }
+
+bool IsNeutwo() { return shader_injection.tone_map_type == TONE_MAP_TYPE_NEUTWO; }
+
+bool IsPsychoV22() { return shader_injection.tone_map_type == TONE_MAP_TYPE_PSYCHOV22; }
+
+// Neutwo hat kein eigenes Farbtonmodell und braucht die SDR-Emulation.
+// PsychoV-22 bringt mit MB-Farbtonwiederherstellung und M-Zapfen-Bias ein
+// eigenes mit und startet deshalb neutral bei 0.
+// Gibt die Einstellung zurueck, damit der Aufrufer den Wert uebernehmen kann.
+renodx::utils::settings::Setting* SyncHueShiftDefault(float tone_map_type) {
+  auto* hue_shift = renodx::utils::settings::FindSetting("ToneMapHueShift");
+  if (hue_shift != nullptr) {
+    hue_shift->default_value = (tone_map_type == TONE_MAP_TYPE_PSYCHOV22) ? 0.f : 20.f;
+  }
+  return hue_shift;
+}
 
 renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
@@ -36,38 +58,46 @@ renodx::utils::settings::Settings settings = {
         .binding = &shader_injection.tone_map_type,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
         .default_value = 1.f,
-        .label = "Tone Mapper",
-        .section = "Tone Mapping",
-        .tooltip = "Sets the tone mapper type",
-        .labels = {"Vanilla (None)", "Neutwo"},
+        .label = "Tonemapper",
+        .section = "Tonemapping",
+        .tooltip = "Legt den Typ des Tonemappers fest",
+        .labels = {"Vanilla (Keiner)", "Neutwo", "PsychoV-22"},
+        .on_change_value = [](float previous, float current) {
+          // Laeuft bereits unter global_mutex, deshalb direkt setzen:
+          // UpdateSetting() wuerde dieselbe Sperre erneut anfordern.
+          auto* hue_shift = SyncHueShiftDefault(current);
+          if (hue_shift != nullptr) {
+            hue_shift->Set(hue_shift->default_value)->Write();
+          }
+        },
     },
     new renodx::utils::settings::Setting{
         .key = "ToneMapPeakNits",
         .binding = &shader_injection.peak_white_nits,
         .default_value = 1000.f,
-        .label = "Peak Brightness",
-        .section = "Tone Mapping",
-        .tooltip = "Sets the value of peak white in nits",
+        .label = "Spitzenhelligkeit",
+        .section = "Tonemapping",
+        .tooltip = "Legt den Wert für Spitzenweiß in Nits fest",
         .min = 48.f,
         .max = 4000.f,
-        .is_enabled = []() { return shader_injection.tone_map_type != 0; },
+        .is_enabled = []() { return IsToneMapped(); },
     },
     new renodx::utils::settings::Setting{
         .key = "ToneMapOverrideBrightness",
         .binding = &shader_injection.tone_map_override_brightness,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
         .default_value = 1.f,
-        .label = "Override Brightness Slider",
-        .section = "Tone Mapping",
-        .tooltip = "Overrides the in-game brightness slider",
+        .label = "Helligkeitsregler überschreiben",
+        .section = "Tonemapping",
+        .tooltip = "Überschreibt den spielinternen Helligkeitsregler",
     },
     new renodx::utils::settings::Setting{
         .key = "ToneMapGameNits",
         .binding = &shader_injection.diffuse_white_nits,
         .default_value = 203.f,
-        .label = "Game Brightness",
-        .section = "Tone Mapping",
-        .tooltip = "Sets the value of 100% white in nits",
+        .label = "Spielhelligkeit",
+        .section = "Tonemapping",
+        .tooltip = "Legt den Wert für 100 % Weiß in Nits fest",
         .min = 48.f,
         .max = 500.f,
         .is_enabled = []() { return shader_injection.tone_map_override_brightness != 0; },
@@ -77,103 +107,123 @@ renodx::utils::settings::Settings settings = {
         .binding = &shader_injection.gamma_correction,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
         .default_value = 1.f,
-        .label = "SDR EOTF Emulation",
-        .section = "Tone Mapping",
-        .tooltip = "Overrides in-game contrast slider, emulates a 2.2 EOTF",
-        .labels = {"Vanilla (Contrast Slider)", "2.2 (Per Channel)"},
+        .label = "SDR-EOTF-Emulation",
+        .section = "Tonemapping",
+        .tooltip = "Überschreibt den spielinternen Kontrastregler und emuliert eine 2.2-EOTF",
+        .labels = {"Vanilla (Kontrastregler)", "2.2 (Pro Kanal)"},
     },
     new renodx::utils::settings::Setting{
         .key = "ToneMapHueShift",
         .binding = &shader_injection.tone_map_hue_shift,
         .default_value = 20.f,
-        .label = "Hue Shift",
-        .section = "Tone Mapping",
-        .tooltip = "Emulates hue shifting from SDR tonemapping",
+        .label = "Farbtonverschiebung",
+        .section = "Tonemapping",
+        .tooltip = "Emuliert die Farbtonverschiebung des SDR-Tonemappings."
+                   "\nStandard bei Neutwo: 20."
+                   "\nStandard bei PsychoV-22: 0, da dieser ein eigenes"
+                   "\nFarbtonmodell mitbringt.",
         .max = 100.f,
-        .is_enabled = []() { return shader_injection.tone_map_type != 0; },
+        .is_enabled = []() { return IsToneMapped(); },
         .parse = [](float value) { return value * 0.01f; },
     },
     new renodx::utils::settings::Setting{
         .key = "ColorGradeExposure",
         .binding = &shader_injection.tone_map_exposure,
         .default_value = 1.f,
-        .label = "Exposure",
-        .section = "Color Grading",
+        .label = "Belichtung",
+        .section = "Farbkorrektur",
         .max = 2.f,
         .format = "%.2f",
-        .is_enabled = []() { return shader_injection.tone_map_type != 0; },
+        .is_enabled = []() { return IsToneMapped(); },
     },
     new renodx::utils::settings::Setting{
         .key = "ColorGradeHighlights",
         .binding = &shader_injection.tone_map_highlights,
         .default_value = 50.f,
-        .label = "Highlights",
-        .section = "Color Grading",
+        .label = "Lichter",
+        .section = "Farbkorrektur",
         .max = 100.f,
-        .is_enabled = []() { return shader_injection.tone_map_type != 0; },
+        .is_enabled = []() { return IsToneMapped(); },
         .parse = [](float value) { return value * 0.02f; },
     },
     new renodx::utils::settings::Setting{
         .key = "ColorGradeShadows",
         .binding = &shader_injection.tone_map_shadows,
         .default_value = 50.f,
-        .label = "Shadows",
-        .section = "Color Grading",
+        .label = "Schatten",
+        .section = "Farbkorrektur",
         .max = 100.f,
-        .is_enabled = []() { return shader_injection.tone_map_type != 0; },
+        .is_enabled = []() { return IsToneMapped(); },
         .parse = [](float value) { return value * 0.02f; },
     },
     new renodx::utils::settings::Setting{
         .key = "ColorGradeContrast",
         .binding = &shader_injection.tone_map_contrast,
         .default_value = 50.f,
-        .label = "Contrast",
-        .section = "Color Grading",
+        .label = "Kontrast",
+        .section = "Farbkorrektur",
         .max = 100.f,
-        .is_enabled = []() { return shader_injection.tone_map_type != 0; },
+        .is_enabled = []() { return IsToneMapped(); },
         .parse = [](float value) { return value * 0.02f; },
     },
     new renodx::utils::settings::Setting{
         .key = "ColorGradeSaturation",
         .binding = &shader_injection.tone_map_saturation,
         .default_value = 50.f,
-        .label = "Saturation",
-        .section = "Color Grading",
+        .label = "Sättigung",
+        .section = "Farbkorrektur",
+        .tooltip = "Bei PsychoV-22 steuert dies die Farbreinheit im LMS-Bereich.",
         .max = 100.f,
-        .is_enabled = []() { return shader_injection.tone_map_type != 0; },
+        .is_enabled = []() { return IsToneMapped(); },
+        .parse = [](float value) { return value * 0.02f; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "ColorGradeConeResponse",
+        .binding = &shader_injection.tone_map_cone_response,
+        .default_value = 50.f,
+        .label = "Zapfenantwort",
+        .section = "Farbkorrektur",
+        .tooltip = "Steuert die Zapfenantwort-Formung von PsychoV-22."
+                   "\nSkaliert Kontrast und Farbreinheit gemeinsam."
+                   "\nNur mit PsychoV-22 verfügbar.",
+        .max = 100.f,
+        .is_enabled = []() { return IsPsychoV22(); },
         .parse = [](float value) { return value * 0.02f; },
     },
     new renodx::utils::settings::Setting{
         .key = "ColorGradeHighlightSaturation",
         .binding = &shader_injection.tone_map_highlight_saturation,
         .default_value = 50.f,
-        .label = "Highlight Saturation",
-        .section = "Color Grading",
-        .tooltip = "Adds or removes highlight color.",
+        .label = "Lichtersättigung",
+        .section = "Farbkorrektur",
+        .tooltip = "Fügt den Lichtern Farbe hinzu oder entzieht sie."
+                   "\nNur mit Neutwo verfügbar.",
         .max = 100.f,
-        .is_enabled = []() { return shader_injection.tone_map_type != 0; },
+        .is_enabled = []() { return IsNeutwo(); },
         .parse = [](float value) { return value * 0.02f; },
     },
     new renodx::utils::settings::Setting{
         .key = "ColorGradeBlowout",
         .binding = &shader_injection.tone_map_blowout,
         .default_value = 0.f,
-        .label = "Blowout",
-        .section = "Color Grading",
-        .tooltip = "Controls highlight desaturation due to overexposure.",
+        .label = "Überstrahlung",
+        .section = "Farbkorrektur",
+        .tooltip = "Steuert die Entsättigung der Lichter durch Überbelichtung."
+                   "\nNur mit Neutwo verfügbar.",
         .max = 100.f,
-        .is_enabled = []() { return shader_injection.tone_map_type != 0; },
+        .is_enabled = []() { return IsNeutwo(); },
         .parse = [](float value) { return value * 0.01f; },
     },
     new renodx::utils::settings::Setting{
         .key = "ColorGradeFlare",
         .binding = &shader_injection.tone_map_flare,
         .default_value = 0.f,
-        .label = "Flare",
-        .section = "Color Grading",
-        .tooltip = "Flare/Glare Compensation",
+        .label = "Streulicht",
+        .section = "Farbkorrektur",
+        .tooltip = "Kompensation von Streu- und Blendlicht."
+                   "\nNur mit Neutwo verfügbar.",
         .max = 100.f,
-        .is_enabled = []() { return shader_injection.tone_map_type != 0; },
+        .is_enabled = []() { return IsNeutwo(); },
         .parse = [](float value) { return value * 0.01f; },
     },
     new renodx::utils::settings::Setting{
@@ -181,17 +231,23 @@ renodx::utils::settings::Settings settings = {
         .binding = &shader_injection.custom_hdr10_encoding,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
         .default_value = 1.f,
-        .label = "HDR10 Encoding",
-        .section = "Advanced",
-        .tooltip = "Sets the HDR10 Encoding format",
-        .labels = {"Vanilla (PQ Approximation)", "PQ"},
+        .label = "HDR10-Kodierung",
+        .section = "Erweitert",
+        .tooltip = "Legt das Format der HDR10-Kodierung fest",
+        .labels = {"Vanilla (PQ-Näherung)", "PQ"},
     },
     new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::BUTTON,
-        .label = "Reset All",
-        .section = "Options",
+        .label = "Alles zurücksetzen",
+        .section = "Optionen",
         .group = "button-line-1",
         .on_change = []() {
+          // Die Schleife setzt den Tonemapper mit zurueck, deshalb muss der
+          // Standard der Farbtonverschiebung vorher darauf zeigen.
+          auto* tone_map_type = renodx::utils::settings::FindSetting("ToneMapType");
+          if (tone_map_type != nullptr) {
+            SyncHueShiftDefault(tone_map_type->default_value);
+          }
           for (auto* setting : settings) {
             if (setting->key.empty()) continue;
             if (!setting->can_reset) continue;
@@ -211,7 +267,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::BUTTON,
-        .label = "More Mods",
+        .label = "Weitere Mods",
         .section = "Links",
         .group = "button-line-2",
         .tint = 0x2B3137,
@@ -240,7 +296,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::TEXT,
         .label = std::string("Build: ") + renodx::utils::date::ISO_DATE_TIME,
-        .section = "About",
+        .section = "Über",
     },
 };
 
@@ -255,6 +311,7 @@ void OnPresetOff() {
   renodx::utils::settings::UpdateSetting("ColorGradeShadows", 50.f);
   renodx::utils::settings::UpdateSetting("ColorGradeContrast", 50.f);
   renodx::utils::settings::UpdateSetting("ColorGradeSaturation", 50.f);
+  renodx::utils::settings::UpdateSetting("ColorGradeConeResponse", 50.f);
   renodx::utils::settings::UpdateSetting("ColorGradeHighlightSaturation", 50.f);
   renodx::utils::settings::UpdateSetting("ColorGradeBlowout", 0.f);
   renodx::utils::settings::UpdateSetting("ColorGradeFlare", 0.f);
@@ -267,6 +324,9 @@ bool fired_on_init_swapchain = false;
 void OnInitSwapchain(reshade::api::swapchain* swapchain, bool resize) {
   if (fired_on_init_swapchain) return;
   fired_on_init_swapchain = true;
+  // Nur den Standard an den geladenen Tonemapper angleichen. Ein gespeicherter
+  // eigener Wert bleibt erhalten.
+  SyncHueShiftDefault(shader_injection.tone_map_type);
   auto peak = renodx::utils::swapchain::GetPeakNits(swapchain);
   if (peak.has_value()) {
     settings[1]->default_value = peak.value();
@@ -277,7 +337,7 @@ void OnInitSwapchain(reshade::api::swapchain* swapchain, bool resize) {
 }  // namespace
 
 extern "C" __declspec(dllexport) constexpr const char* NAME = "RenoDX";
-extern "C" __declspec(dllexport) constexpr const char* DESCRIPTION = "RenoDX for God of War (2018)";
+extern "C" __declspec(dllexport) constexpr const char* DESCRIPTION = "RenoDX für God of War (2018)";
 
 BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
   switch (fdw_reason) {

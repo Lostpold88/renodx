@@ -100,3 +100,45 @@ float3 ApplySaturationBlowoutHueCorrectionHighlightSaturation(float3 ungraded, f
 float3 ApplyGammaCorrection(float3 incorrect_color) {
   return renodx::color::correct::GammaSafe(incorrect_color);
 }
+
+// Wendet den ausgewaehlten Tonemapper samt Farbkorrektur an.
+// Ein- und Ausgabe sind BT.2020-linear, normiert auf 1.0 = Diffusweiss.
+// peak_ratio ist die Spitzenhelligkeit relativ zum Diffusweiss.
+float3 ApplyToneMapBT2020(float3 ungraded, float3 untonemapped, float peak_ratio) {
+  // PsychoV-22 gradet selbst im LMS-Bereich: Belichtung, Lichter, Schatten,
+  // Kontrast und Saettigung gehen direkt in die Kurve, damit nicht zweimal
+  // gegradet wird. Streulicht, Ueberstrahlung und Lichtersaettigung gehoeren
+  // zum Neutwo-Pfad und bleiben hier ungenutzt.
+  if (RENODX_TONE_MAP_TYPE == RENODX_TONE_MAP_TYPE_PSYCHOV22) {
+    return renodx::color::bt2020::from::BT709(
+        renodx::tonemap::psychov::psychotm_test22(
+            renodx::color::bt709::from::BT2020(ungraded),
+            peak_ratio,
+            RENODX_TONE_MAP_EXPOSURE,
+            RENODX_TONE_MAP_HIGHLIGHTS,
+            RENODX_TONE_MAP_SHADOWS,
+            RENODX_TONE_MAP_CONTRAST,
+            RENODX_TONE_MAP_SATURATION,  // Reinheit (purity)
+            1.f,                         // Ausbleichen (reserviert)
+            100.f,                       // Clip-Punkt (reserviert)
+            1.f,                         // Farbtonwiederherstellung (reserviert)
+            1.f,                         // Adaptionskontrast (veraltet)
+            0,                           // Weisskurvenmodus (veraltet)
+            RENODX_TONE_MAP_CONE_RESPONSE,
+            0.18f.xxx,  // Adaptionszustand (Anker-Eingang)
+            0.18f.xxx,  // Hintergrundzustand (Anker-Ausgang)
+            1.f,        // Gamut-Kompression
+            1,          // BT.2020-Huelle
+            1.f,        // Adaptive Normalisierung (veraltet)
+            0.f));      // 0 = automatische Kompression
+  }
+
+  float3 color = ungraded;
+  if (RENODX_TONE_MAP_TYPE != RENODX_TONE_MAP_TYPE_VANILLA) {
+    color = ApplyExposureContrastFlareHighlightsShadowsByLuminanceBT2020(color);
+    color = renodx::tonemap::neutwo::PerChannel(color, peak_ratio);
+  }
+  return renodx::color::bt2020::from::BT709(
+      ApplySaturationBlowoutHueCorrectionHighlightSaturation(
+          renodx::color::bt709::from::BT2020(color), untonemapped));
+}
