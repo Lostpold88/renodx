@@ -472,9 +472,30 @@ renodx_custom::tonemap::psycho::config17::Config CreatePsycho17Config() {
       RENODX_TONE_MAP_HUE_RETENTION);
 }
 
+// Scene mid gray at the input of the tone curve. The game's own pre tone map
+// curve runs before this in the PostProcess pass and is not gated on the tone
+// mapper, so both tone mappers see the same signal here and place it the same
+// way.
+static const float PSYCHOV22_SCENE_MID_GRAY = 0.18f;
+
+// Mid gray at the output, relative to diffuse white. The ACES branch reaches
+// 0.1024 / 0.1000 / 0.0995 for the three `ACES Mid Gray` targets, because the
+// exp-shift system pins 0.18 to ACES_MID and ACES_DIFFUSE is ACES_MID * 10.
+// The spread across those targets is under 2.5%, so PsychoV-22 does not follow
+// the setting and uses the RenoDX convention instead. That keeps the curve free
+// of the ACES scaffolding without moving the exposure noticeably.
+static const float PSYCHOV22_DISPLAY_MID_GRAY = 0.1f;
+
 // User grading -> ACES -> 2.2 EOTF emulation -> apply per channel purity onto luminance curve -> grain -> diffuse white scale + PQ encode
 float3 ApplyToneMapEncodePQ(float3 untonemapped_ap1, float cbuffer_peak_nits, float cbuffer_diffuse_white_nits, float2 uv) {
-  untonemapped_ap1 = renodx::tonemap::aces::RRT(mul(renodx::color::AP1_TO_AP0_MAT, untonemapped_ap1));
+  // PsychoV-22 replaces the full ACES rendering, so the RRT sweeteners (glow,
+  // red modifier, global desaturation) are skipped as well. PsychoV-22 brings
+  // its own observer model for hue and purity and would otherwise be handed an
+  // image that already carries the ACES look. The RRT leaves neutrals alone, so
+  // skipping it does not shift the tone response, only the chromatic sweetening.
+  if (TONE_MAP_TYPE != PRAGMATA_TONE_MAP_TYPE_PSYCHOV22) {
+    untonemapped_ap1 = renodx::tonemap::aces::RRT(mul(renodx::color::AP1_TO_AP0_MAT, untonemapped_ap1));
+  }
 
   float untonemapped_lum = YfFromAP1(untonemapped_ap1);
   renodx_custom::tonemap::psycho::config17::Config psycho17_config = CreatePsycho17Config();
@@ -483,60 +504,138 @@ float3 ApplyToneMapEncodePQ(float3 untonemapped_ap1, float cbuffer_peak_nits, fl
 
   float3 tonemapped_bt2020;
 
-  // In order to change ACES_MID, we use The Academy's exp-shift system
-  // The curve is built around 4.8 ACES_MID however, so changing it causes the curve to break
-  // Values other than 4.8 make it so that increasing peak causes midtones to compress and vice-versa
-  // We fix this by basing the exp-shifted curve on reference ACES_MAX and ACES_MIN values
-  // We then scale brightness like SDR as a linear scalar
-  // ACES_MAX and ACES_MIN are pre-adjusted in order to account for the post-tonemap diffuse white scalar which we define as `10.f * ACES_MID`
-  float ACES_MID;
-  float EXP_SHIFT_REFERENCE_MAX;
-  float EXP_SHIFT_REFERENCE_MIN;
-  if (TONE_MAP_ACES_MID_GRAY == 0.f) {
-    ACES_MID = 4.8f;
-    EXP_SHIFT_REFERENCE_MAX = 48.f;
-    EXP_SHIFT_REFERENCE_MIN = 0.02f;
-  } else if (TONE_MAP_ACES_MID_GRAY == 1.f) {
-    ACES_MID = 10.f;
-    EXP_SHIFT_REFERENCE_MAX = 100.f;
-    EXP_SHIFT_REFERENCE_MIN = 0.02f;
+  if (TONE_MAP_TYPE == PRAGMATA_TONE_MAP_TYPE_PSYCHOV22) {
+    // PsychoV-22 only replaces the tone curve. Exposure, contrast, saturation and
+    // the remaining sliders already run in the pre- and post-tonemap grading
+    // stages around it, so every grading argument is passed neutral (1.0) to
+    // avoid grading twice. Cone Response is the one control that shapes the curve
+    // itself: with all other controls neutral it is exactly the log-log slope of
+    // the curve at the anchor.
+    //
+    // None of the ACES scaffolding is built here: PsychoV-22 anchors mid gray on
+    // its own and reaches its peak asymptotically, so it needs neither the
+    // exp-shift system nor an ACES min/black level.
+    //
+    // The 2.2 EOTF emulation is not optional on this path, it is part of the
+    // rendering. PsychoV-22 keeps a near constant log-log slope down into the
+    // shadows instead of bending into a toe the way the ACES SSTS does, so
+    // without the emulation the blacks stay lifted and the image reads milky.
+    // `SDR EOTF Emulation` is therefore pinned to 2.2 here and greyed out in the
+    // UI. The peak is pre-corrected so it lands back on the user setting after
+    // the correction below.
+    float display_peak = renodx::color::correct::Gamma(RENODX_PEAK_WHITE_NITS / RENODX_DIFFUSE_WHITE_NITS, true);
+
+    float3 tonemapped_bt709 = renodx::tonemap::psychov::psychotm_test22(
+        renodx::color::bt709::from::AP1(untonemapped_ap1),
+        display_peak,
+        1.f,    // exposure (graded before the curve)
+        1.f,    // highlights (graded before the curve)
+        1.f,    // shadows (graded before the curve)
+        1.f,    // contrast (graded before the curve)
+        1.f,    // purity (graded after the curve)
+        1.f,    // bleaching (reserved)
+        100.f,  // clip point (reserved)
+        1.f,    // hue restore (reserved)
+        1.f,    // adaptation contrast (deprecated)
+        0,      // white curve mode (deprecated)
+        RENODX_TONE_MAP_CONE_RESPONSE,
+        PSYCHOV22_SCENE_MID_GRAY.xxx,    // anchor in
+        PSYCHOV22_DISPLAY_MID_GRAY.xxx,  // anchor out
+        1.f,                             // gamut compression
+        // BT.2020 hull instead of BT.709. In-hull colors pass the compression
+        // untouched, only colors outside BT.2020 are rolled onto the hull, so the
+        // full BT.2020 output volume stays available. Colors outside BT.709 leave
+        // the curve as negative BT.709 values and stay that way until the BT.2020
+        // conversion below.
+        1,
+        1.f,   // adaptive normalization (deprecated)
+        0.f);  // 0 = automatic compression
+
+    // EOTF emulation on luminance, not per channel.
+    //
+    // Per-channel GammaSafe runs a nonlinear curve on each BT.709 component
+    // separately, so it changes the ratios between them. For a color outside
+    // BT.709 those ratios are exactly what carries the wide gamut, because the
+    // out-of-hull part lives in the negative components. The curve's gain is
+    // strongly level dependent - roughly 0.63x at 0.01, 0.99x at 0.1 and 1.02x at
+    // 0.2 - so a dim saturated color has its small and its large components scaled
+    // by very different factors and gets pulled toward the neutral axis.
+    //
+    // Measured: BT.2020 (0, 0.2, 0) is BT.709 (-0.1175, +0.2266, -0.0201). Per
+    // channel that comes back as BT.2020 (+0.0017, +0.2038, +0.0041) - both
+    // negative excursions have flipped positive, so the color has left the hull
+    // toward the interior, a shift of 0.029 in BT.2020 rg chromaticity.
+    //
+    // Scaling by a luminance ratio is one scalar per pixel, so chromaticity is
+    // untouched (measured shift: 0.000) and the color stays on its BT.2020 hull
+    // ray. For neutrals both variants agree to within 1e-13, so the shadow crush
+    // and the midtone placement are unchanged - only chromatic pixels keep their
+    // purity.
+    float y_in = renodx::color::yf::from::BT709(tonemapped_bt709);
+    tonemapped_bt709 = renodx::color::correct::Luminance(
+        tonemapped_bt709,
+        y_in,
+        renodx::color::correct::Gamma(max(0.f, y_in)));
+
+    // `Scaling` is not applied here: PsychoV-22 solves luminance, purity and hue
+    // together in LMS instead of blending a per channel and a luminance curve.
+    tonemapped_bt2020 = renodx::color::bt2020::from::BT709(tonemapped_bt709);
   } else {
-    ACES_MID = 15.f;
-    EXP_SHIFT_REFERENCE_MAX = 1000.f;
-    EXP_SHIFT_REFERENCE_MIN = 0.0001f;
-  }
-  const float ACES_DIFFUSE = ACES_MID * 10.f;
-  const float ACES_MIN = 0.0001f;
-  float aces_min = ACES_MIN / RENODX_DIFFUSE_WHITE_NITS;
-  float aces_max = (RENODX_PEAK_WHITE_NITS / RENODX_DIFFUSE_WHITE_NITS);
-
-  if (RENODX_GAMMA_CORRECTION == 1.f) {
-    aces_max = renodx::color::correct::Gamma(aces_max, true);
-    aces_min = renodx::color::correct::Gamma(aces_min, true);
-  } else if (RENODX_GAMMA_CORRECTION == 2.f) {
-    aces_min /= 10.f;
-  }
-
-  renodx::tonemap::aces::ODTConfig ODT_config = renodx_custom::tonemap::aces::CreateODTConfig(aces_min * ACES_DIFFUSE, aces_max * ACES_DIFFUSE, ACES_MID, true, EXP_SHIFT_REFERENCE_MAX, EXP_SHIFT_REFERENCE_MIN);
-
-  float3 tonemapped_ap1 = renodx::tonemap::aces::ODTToneMap(untonemapped_ap1, ODT_config) / ACES_DIFFUSE;
-  float3 tonemapped_bt709 = renodx::color::bt709::from::AP1(tonemapped_ap1);
-
-  if (RENODX_GAMMA_CORRECTION == 1.f) {
-    tonemapped_bt709 = renodx::color::correct::GammaSafe(tonemapped_bt709);
-  }
-
-  tonemapped_bt2020 = renodx::color::bt2020::from::BT709(tonemapped_bt709);
-
-  if (RENODX_TONE_MAP_SCALING == 0.f) {
-    float tonemapped_perch_yf = renodx::color::yf::from::BT2020(tonemapped_bt2020);
-
-    float untonemapped_yf = YfFromAP1(untonemapped_ap1);
-    float tonemapped_lum_yf = renodx::tonemap::aces::ODTToneMap(untonemapped_yf, ODT_config) / ACES_DIFFUSE;
-    if (RENODX_GAMMA_CORRECTION == 1.f) {
-      tonemapped_lum_yf = renodx::color::correct::GammaSafe(tonemapped_lum_yf);
+    // In order to change ACES_MID, we use The Academy's exp-shift system
+    // The curve is built around 4.8 ACES_MID however, so changing it causes the curve to break
+    // Values other than 4.8 make it so that increasing peak causes midtones to compress and vice-versa
+    // We fix this by basing the exp-shifted curve on reference ACES_MAX and ACES_MIN values
+    // We then scale brightness like SDR as a linear scalar
+    // ACES_MAX and ACES_MIN are pre-adjusted in order to account for the post-tonemap diffuse white scalar which we define as `10.f * ACES_MID`
+    float ACES_MID;
+    float EXP_SHIFT_REFERENCE_MAX;
+    float EXP_SHIFT_REFERENCE_MIN;
+    if (TONE_MAP_ACES_MID_GRAY == 0.f) {
+      ACES_MID = 4.8f;
+      EXP_SHIFT_REFERENCE_MAX = 48.f;
+      EXP_SHIFT_REFERENCE_MIN = 0.02f;
+    } else if (TONE_MAP_ACES_MID_GRAY == 1.f) {
+      ACES_MID = 10.f;
+      EXP_SHIFT_REFERENCE_MAX = 100.f;
+      EXP_SHIFT_REFERENCE_MIN = 0.02f;
+    } else {
+      ACES_MID = 15.f;
+      EXP_SHIFT_REFERENCE_MAX = 1000.f;
+      EXP_SHIFT_REFERENCE_MIN = 0.0001f;
     }
-    tonemapped_bt2020 = max(0, renodx::color::correct::Luminance(tonemapped_bt2020, tonemapped_perch_yf, tonemapped_lum_yf));
+    const float ACES_DIFFUSE = ACES_MID * 10.f;
+    const float ACES_MIN = 0.0001f;
+    float aces_min = ACES_MIN / RENODX_DIFFUSE_WHITE_NITS;
+    float aces_max = (RENODX_PEAK_WHITE_NITS / RENODX_DIFFUSE_WHITE_NITS);
+
+    if (RENODX_GAMMA_CORRECTION == 1.f) {
+      aces_max = renodx::color::correct::Gamma(aces_max, true);
+      aces_min = renodx::color::correct::Gamma(aces_min, true);
+    } else if (RENODX_GAMMA_CORRECTION == 2.f) {
+      aces_min /= 10.f;
+    }
+
+    renodx::tonemap::aces::ODTConfig ODT_config = renodx_custom::tonemap::aces::CreateODTConfig(aces_min * ACES_DIFFUSE, aces_max * ACES_DIFFUSE, ACES_MID, true, EXP_SHIFT_REFERENCE_MAX, EXP_SHIFT_REFERENCE_MIN);
+
+    float3 tonemapped_ap1 = renodx::tonemap::aces::ODTToneMap(untonemapped_ap1, ODT_config) / ACES_DIFFUSE;
+    float3 tonemapped_bt709 = renodx::color::bt709::from::AP1(tonemapped_ap1);
+
+    if (RENODX_GAMMA_CORRECTION == 1.f) {
+      tonemapped_bt709 = renodx::color::correct::GammaSafe(tonemapped_bt709);
+    }
+
+    tonemapped_bt2020 = renodx::color::bt2020::from::BT709(tonemapped_bt709);
+
+    if (RENODX_TONE_MAP_SCALING == 0.f) {
+      float tonemapped_perch_yf = renodx::color::yf::from::BT2020(tonemapped_bt2020);
+
+      float untonemapped_yf = YfFromAP1(untonemapped_ap1);
+      float tonemapped_lum_yf = renodx::tonemap::aces::ODTToneMap(untonemapped_yf, ODT_config) / ACES_DIFFUSE;
+      if (RENODX_GAMMA_CORRECTION == 1.f) {
+        tonemapped_lum_yf = renodx::color::correct::GammaSafe(tonemapped_lum_yf);
+      }
+      tonemapped_bt2020 = max(0, renodx::color::correct::Luminance(tonemapped_bt2020, tonemapped_perch_yf, tonemapped_lum_yf));
+    }
   }
 
   float3 hue_emulation_source_bt2020 = tonemapped_bt2020;
