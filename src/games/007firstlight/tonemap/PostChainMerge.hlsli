@@ -175,9 +175,16 @@ float3 SampleSRGBColorCorrectionLUT(float3 color, float hdr_scale, float hdr_hea
   // Bewusst ohne max(0, ...): EncodeSafe/DecodeSafe sind vorzeichenerhaltend,
   // damit ueberleben Auslenkungen ausserhalb BT.709 den Umweg. Geklemmt wird
   // erst spaeter in BT.2020, wo weniger verloren geht.
+  //
+  // Nur in den Varianten umgehen, die in ApplyToneMap ueberhaupt einen
+  // PsychoV-Zweig haben. Bei Reinhard und Hable laeuft weiterhin die
+  // SDR-Kurve des Spiels; dort den LUT zu entfernen wuerde dessen
+  // Farbgestaltung kosten, ohne etwas von PsychoV-22 einzubringen.
+#if POSTCHAINMERGE_TONEMAP_TYPE == POSTCHAINMERGE_TONEMAP_FILM || POSTCHAINMERGE_TONEMAP_TYPE == POSTCHAINMERGE_TONEMAP_NONE
   if (TONE_MAP_TYPE == FIRSTLIGHT_TONE_MAP_TYPE_PSYCHOV22) {
     return renodx::color::srgb::EncodeSafe(color);
   }
+#endif
 
   if (TONE_MAP_TYPE != 0.f) {
     float3 adaptive_state_lms;
@@ -244,7 +251,11 @@ float3 FinalizeOutput(float3 color) {
   if (TONE_MAP_TYPE != 0.f) {
     color = renodx::color::srgb::DecodeSafe(color);
 
-    if (RENODX_TONE_MAP_SCALING == 1.f) {
+    // PsychoV-22 liefert Farben ausserhalb BT.709 als negative BT.709-Werte.
+    // TransferPurityAndWeightedHueFromLMS rechnet in MacLeod-Boynton, dessen
+    // Koordinaten l = Lw/(Lw+Mw) bei negativen Zapfenwerten weglaufen. Deshalb
+    // dort immer die vorzeichenerhaltende kanalweise Korrektur.
+    if (RENODX_TONE_MAP_SCALING == 1.f || TONE_MAP_TYPE == FIRSTLIGHT_TONE_MAP_TYPE_PSYCHOV22) {
       color = renodx::color::correct::GammaSafe(color);
     } else {  // luminance gamma correction with purity and some hues from per channel
       float y_in = renodx::color::yf::from::BT709(color);

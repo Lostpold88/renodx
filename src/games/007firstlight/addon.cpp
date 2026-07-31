@@ -85,10 +85,11 @@ renodx::utils::settings::Settings settings = {
         .section = "Tonemapping",
         .tooltip = "Luminanz skaliert Farben gleichmäßig, Pro Kanal entspricht dem"
                    "\nursprünglichen Verhalten des Tonemappers."
-                   "\nBei PsychoV-22 wirkt dies nur noch auf die Gammakorrektur,"
-                   "\nnicht auf die Tonwertkurve.",
+                   "\nNicht mit PsychoV-22 verfügbar: dort wird durchgehend"
+                   "\nkanalweise korrigiert, damit Farben außerhalb BT.709"
+                   "\nerhalten bleiben.",
         .labels = {"Luminanz", "Pro Kanal"},
-        .is_enabled = []() { return IsToneMapped(); },
+        .is_enabled = []() { return IsToneMapped() && !IsPsychoV22(); },
     },
     new renodx::utils::settings::Setting{
         .key = "ToneMapConeResponse",
