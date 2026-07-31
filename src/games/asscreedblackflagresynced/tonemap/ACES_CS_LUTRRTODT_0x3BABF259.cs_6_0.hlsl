@@ -1,3 +1,5 @@
+#include "./tonemap.hlsli"
+
 struct ACESTonemapperParameters__Constants {
   float ACESTonemapperParameters__Constants_000;
 };
@@ -364,6 +366,26 @@ void main(
   float _1434;
   float _6[9];
   float _7[9];
+
+#if 1
+  // The game picks this builder when ACES is selected as its tone mapper. Left
+  // alone it would hand back a vanilla ACES LUT while the UI still claims a
+  // RenoDX tone mapper is running, so route it through the same path as the
+  // other two builders. Note the exposure scalar sits at c004.x here, not at
+  // c003.z like it does in HDR_/SDR_CS_LUTRRTODT.
+  if (RENODX_TONE_MAP_TYPE != 0.f) {
+    float3 untonemapped_ap1 = 32.f * exp2((float3(SV_DispatchThreadID) * 0.6451612710952759f) - 12.473931312561035f);
+    u0_space5[SV_DispatchThreadID] = float4(
+        BuildToneMapLUTOutput(
+            untonemapped_ap1,
+            cb0_space5_004x,
+            cb0_space5_003w,
+            cb0_space5_003x != 0),
+        1.f);
+    return;
+  }
+#endif
+
   _22 = cb0_space5_004x * exp2((((float)((uint)SV_DispatchThreadID.x)) * 0.6451612710952759f) + -12.473931312561035f);
   _23 = cb0_space5_004x * exp2((((float)((uint)SV_DispatchThreadID.y)) * 0.6451612710952759f) + -12.473931312561035f);
   _24 = cb0_space5_004x * exp2((((float)((uint)SV_DispatchThreadID.z)) * 0.6451612710952759f) + -12.473931312561035f);

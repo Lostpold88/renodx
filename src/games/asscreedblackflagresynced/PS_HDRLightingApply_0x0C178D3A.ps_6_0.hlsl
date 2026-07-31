@@ -631,6 +631,23 @@ float4 main(
   _162 *= CUSTOM_BLOOM;
   _163 *= CUSTOM_BLOOM;
 
+#if 1
+  // Bloom scaling: fade the bloom out over dark scene content instead of
+  // letting it sit on top as a flat black floor.
+  {
+    const float3 scene_color = _20.rgb * TEXCOORD_1;
+    float3 processed_bloom = float3(_161, _162, _163);
+    const float mid_gray_bloomed = (0.18f + renodx::color::y::from::BT709(processed_bloom)) / 0.18f;
+    const float scene_luminance = renodx::color::y::from::BT709(scene_color) * mid_gray_bloomed;
+    const float bloom_blend = saturate(smoothstep(0.f, 0.18f, scene_luminance));
+    const float3 bloom_scaled = lerp(0.f, processed_bloom, bloom_blend);
+    processed_bloom = lerp(processed_bloom, bloom_scaled, CUSTOM_BLOOM_SCALING * 0.5f);
+    _161 = processed_bloom.x;
+    _162 = processed_bloom.y;
+    _163 = processed_bloom.z;
+  }
+#endif
+
   _165 = (cb0_space1_076x * 1215282323) + 2113019745u;
   _167 = (uint)(_165) >> 16;
   _182 = _161 + (_20.x * TEXCOORD_1);
@@ -669,7 +686,12 @@ float4 main(
     _279 = _216;
     _280 = _217;
   }
-  _299 = t3_space2.SampleLevel(s0_space3, float3(((saturate((log2(_278) * 0.05000000074505806f) + 0.6236965656280518f) * 0.96875f) + 0.015625f), ((saturate((log2(_279) * 0.05000000074505806f) + 0.6236965656280518f) * 0.96875f) + 0.015625f), ((saturate((log2(_280) * 0.05000000074505806f) + 0.6236965656280518f) * 0.96875f) + 0.015625f)), 0.0f);
+  // Tetrahedral rather than the game's trilinear fetch. This LUT carries the
+  // whole tone curve, so trilinear's off-diagonal contributions show up as
+  // tinted greys and banding in smooth HDR gradients.
+  const float3 lut_coordinate = saturate(
+      (log2(float3(_278, _279, _280)) * 0.05000000074505806f) + 0.6236965656280518f);
+  _299 = float4(renodx::lut::SampleTetrahedral(t3_space2, lut_coordinate, 32.f), 1.0f);
   SV_Target.x = _299.x;
   SV_Target.y = _299.y;
   SV_Target.z = _299.z;

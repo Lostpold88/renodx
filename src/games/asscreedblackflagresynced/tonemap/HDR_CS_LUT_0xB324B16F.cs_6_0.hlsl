@@ -195,11 +195,20 @@ void comp_main() {
 #if 1
   if (RENODX_TONE_MAP_TYPE != 0.f) {
     final_color = ApplyUserGradingAP1(final_color, 0.45f);
+    // Coolness and the purity controls both leave AP1, so the graded result can
+    // carry negative components. log2() would turn those into NaN before the
+    // lookup below ever clamps them.
+    final_color = max(0.f, final_color);
   }
 #endif
 
   float3 encoded_color = (log2(final_color) * 0.0500000007450580596923828125f) + 0.6236965656280517578125f;
-  _15[gl_GlobalInvocationID] = float4(_12.SampleLevel(_24, saturate(encoded_color) * 0.96875f + 0.015625f, 0.0f).xyz, 1.0f);
+  // Tetrahedral rather than the game's trilinear fetch. On the neutral axis
+  // trilinear blends in the six off-diagonal corners of the cell and tints
+  // greys, which is exactly where a tone curve varies fastest.
+  _15[gl_GlobalInvocationID] = float4(
+      renodx::lut::SampleTetrahedral(_12, saturate(encoded_color), 32.f),
+      1.0f);
 }
 
 [numthreads(16, 16, 1)]
