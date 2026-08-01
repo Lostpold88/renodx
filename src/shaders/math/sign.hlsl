@@ -22,6 +22,34 @@ SELECT_FUNCTION_GENERATOR(float2)
 SELECT_FUNCTION_GENERATOR(float3)
 SELECT_FUNCTION_GENERATOR(float4)
 #undef SELECT_FUNCTION_GENERATOR
+#elif __SHADER_TARGET_MAJOR <= 5
+// Overwrite the sign bit of `mag` by flipping it only when it differs from the
+// sign bit of `sgn`. The result is bit-for-bit the one the mask-and-OR form
+// below produces, but it never forms `asuint(x) & FLT32_MAGNITUDE`. fxc
+// recognises that mask as an abs and folds it into a source modifier of the
+// consuming instruction; when the consumer cannot carry modifiers it emits
+// invalid bytecode and fails with "error X8000: Abs modifier not allowed for
+// operand #N". Any shader handing CopySign an already non-negative magnitude
+// hits this, which is what SignPow, SignSqrt, Cbrt and the PsychoV curves all
+// do. Costs two extra slots where fxc would otherwise reach a single `bfi`, so
+// it stays scoped to the shader models fxc compiles; dxc has no such bug.
+float CopySign(float mag, float sgn) {
+  uint mag_bits = asuint(mag);
+  return asfloat(mag_bits ^ ((mag_bits ^ asuint(sgn)) & FLT32_SIGN));
+}
+
+#define COPYSIGN_FUNCTION_GENERATOR_VECTOR(SIZE)                     \
+  float##SIZE CopySign(float##SIZE mag, float##SIZE sgn) {           \
+    uint##SIZE mag_bits = asuint(mag);                               \
+    float##SIZE result =                                             \
+        asfloat(mag_bits ^ ((mag_bits ^ asuint(sgn)) & FLT32_SIGN)); \
+    return result;                                                   \
+  }
+
+COPYSIGN_FUNCTION_GENERATOR_VECTOR(2)
+COPYSIGN_FUNCTION_GENERATOR_VECTOR(3)
+COPYSIGN_FUNCTION_GENERATOR_VECTOR(4)
+#undef COPYSIGN_FUNCTION_GENERATOR_VECTOR
 #else
 float CopySign(float mag, float sgn) {
   uint sign_bits = asuint(sgn) & FLT32_SIGN;
