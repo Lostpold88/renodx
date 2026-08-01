@@ -116,6 +116,10 @@ void main(uint3 vThreadID: SV_DispatchThreadID) {
   r0.xyz = float3(6.27739477, 6.27739477, 6.27739477) * r0.xyz;
   r0.xyz = exp2(r0.xyz);
   r1.xyz = float3(100, 100, 100) * r0.xyz;
+
+  // AP0 as the game's LUT produced it, before the ACES RRT sweeteners below
+  // (glow module, red modifier, RRT SAT).
+  float3 untonemapped_ap0 = r1.xyz;
   r0.w = max(r1.x, r1.y);
   r0.w = max(r0.w, r1.z);
   r1.w = min(r1.x, r1.y);
@@ -266,6 +270,15 @@ void main(uint3 vThreadID: SV_DispatchThreadID) {
 
   // SSTS begin
   float3 untonemapped_ap1 = float3(r0.w, r1.x, r0.x);
+
+  if (TONE_MAP_TYPE == DEADSPACE_TONE_MAP_TYPE_PSYCHOV22) {
+    // PsychoV-22 replaces the full ACES rendering, so the RRT sweeteners are
+    // dropped along with the ODT curve. PsychoV-22 carries its own observer
+    // model for hue and purity and would otherwise be handed an image that
+    // already has the ACES look baked in. The RRT leaves neutrals alone, so this
+    // changes only the chromatic sweetening, not the tone response.
+    untonemapped_ap1 = mul(renodx::color::AP0_TO_AP1_MAT, untonemapped_ap0);
+  }
 
   if (TONE_MAP_TYPE != 0.f) {
     // const float ACES_MIN = 0.0001f;

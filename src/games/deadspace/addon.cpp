@@ -8,6 +8,7 @@
 #define DEBUG_LEVEL_0
 
 #include <atomic>
+#include <mutex>
 
 #include <deps/imgui/imgui.h>
 #include <include/reshade.hpp>
@@ -22,58 +23,88 @@
 
 namespace {
 
+constexpr float kToneMapTypeVanilla = 0.f;
+constexpr float kToneMapTypePsychoV22 = 2.f;
+
+// Cone response is the log-log slope of the tone curve at mid gray. The slider
+// is offset so its midpoint 50 lands on the slope of the ACES curve at this
+// mod's defaults, which is 1.36, making the two tone mappers meet at mid gray.
+// Each step stays worth 0.02, matching every other grading slider here.
+constexpr float kConeResponseStep = 0.02f;
+constexpr float kConeResponseNeutral = 1.36f;
+constexpr float kConeResponseOffset = kConeResponseNeutral - (50.f * kConeResponseStep);
+constexpr float kConeResponseDefault = 50.f;
+
 ShaderInjectData shader_injection;
 
+// Everything the LUT builders read. Held in one place so the snapshot taken when
+// a LUT is built and the comparison that raises the warning can never drift
+// apart, and so a control that does not feed the selected tone mapper cannot
+// keep the warning up: Vanilla builds the LUT from nothing else, ACES ignores
+// Cone Response, and PsychoV-22 ignores Working Color Space.
+struct ToneMapLutInputs {
+  float tone_map_type = 1.f;
+  float peak_nits = 1000.f;
+  float override_game_brightness = 0.f;
+  float game_nits = 152.32879f;
+  float working_color_space = 1.f;
+  float cone_response = kConeResponseNeutral;
+
+  bool operator==(const ToneMapLutInputs&) const = default;
+};
+
+ToneMapLutInputs CurrentToneMapLutInputs() {
+  ToneMapLutInputs inputs;
+  inputs.tone_map_type = shader_injection.tone_map_type;
+  if (inputs.tone_map_type == kToneMapTypeVanilla) return inputs;
+
+  inputs.peak_nits = shader_injection.peak_white_nits;
+  inputs.override_game_brightness = shader_injection.override_game_brightness;
+  inputs.game_nits = shader_injection.diffuse_white_nits;
+  if (inputs.tone_map_type == kToneMapTypePsychoV22) {
+    inputs.cone_response = shader_injection.tone_map_cone_response;
+  } else {
+    inputs.working_color_space = shader_injection.tone_map_working_color_space;
+  }
+  return inputs;
+}
+
+// The LUT builders draw on the render thread while the settings overlay writes
+// the injection from the presenting thread, so the applied snapshot is published
+// under a lock rather than as loose floats.
 std::atomic_bool tone_map_lut_invalidated = false;
-float applied_tone_map_type = 1.f;
-float applied_peak_nits = 1000.f;
-float applied_override_game_brightness = 0.f;
-float applied_game_nits = 152.32879f;
-float applied_tone_map_working_color_space = 1.f;
-
-void SetToneMapLutInvalidated(bool invalidated) {
-    tone_map_lut_invalidated.store(invalidated, std::memory_order_relaxed);
-}
-
-bool ToneMapLutValuesDirty() {
-    return shader_injection.tone_map_type != applied_tone_map_type
-                 || shader_injection.peak_white_nits != applied_peak_nits
-                 || shader_injection.override_game_brightness != applied_override_game_brightness
-                 || shader_injection.diffuse_white_nits != applied_game_nits
-                 || shader_injection.tone_map_working_color_space != applied_tone_map_working_color_space;
-}
+std::mutex applied_tone_map_lut_inputs_mutex;
+ToneMapLutInputs applied_tone_map_lut_inputs;  // guarded by the mutex above
 
 void RefreshToneMapLutDirtyState() {
-    SetToneMapLutInvalidated(ToneMapLutValuesDirty());
-}
-
-void MarkToneMapLutApplied() {
-    applied_tone_map_type = shader_injection.tone_map_type;
-    applied_peak_nits = shader_injection.peak_white_nits;
-    applied_override_game_brightness = shader_injection.override_game_brightness;
-    applied_game_nits = shader_injection.diffuse_white_nits;
-    applied_tone_map_working_color_space = shader_injection.tone_map_working_color_space;
-    RefreshToneMapLutDirtyState();
+  ToneMapLutInputs current = CurrentToneMapLutInputs();
+  bool invalidated;
+  {
+    const std::scoped_lock lock(applied_tone_map_lut_inputs_mutex);
+    invalidated = current != applied_tone_map_lut_inputs;
+  }
+  tone_map_lut_invalidated.store(invalidated, std::memory_order_relaxed);
 }
 
 void InitializeAppliedValues() {
-    applied_tone_map_type = shader_injection.tone_map_type;
-    applied_peak_nits = shader_injection.peak_white_nits;
-    applied_override_game_brightness = shader_injection.override_game_brightness;
-    applied_game_nits = shader_injection.diffuse_white_nits;
-    applied_tone_map_working_color_space = shader_injection.tone_map_working_color_space;
+  const std::scoped_lock lock(applied_tone_map_lut_inputs_mutex);
+  applied_tone_map_lut_inputs = CurrentToneMapLutInputs();
 }
 
 void OnToneMapLutBuilderDrawn(reshade::api::command_list* /*cmd_list*/) {
-    MarkToneMapLutApplied();
+  {
+    const std::scoped_lock lock(applied_tone_map_lut_inputs_mutex);
+    applied_tone_map_lut_inputs = CurrentToneMapLutInputs();
+  }
+  RefreshToneMapLutDirtyState();
 }
 
 void OnToneMapLutControlledSettingChanged(float /*previous*/, float /*current*/) {
-    RefreshToneMapLutDirtyState();
+  RefreshToneMapLutDirtyState();
 }
 
 void OnPresetChangedInvalidateIfChanged() {
-    RefreshToneMapLutDirtyState();
+  RefreshToneMapLutDirtyState();
 }
 
 renodx::mods::shader::CustomShaders custom_shaders = {
@@ -112,7 +143,10 @@ renodx::utils::settings::Settings settings = {
         .default_value = 1.f,
         .label = "Tone Mapper",
         .section = "Tone Mapping",
-        .labels = {"Vanilla", "RenoDX"},
+        .tooltip = "RenoDX keeps the game's ACES rendering and only replaces the display mapping.\n"
+                   "PsychoV-22 replaces the ACES rendering outright with a cone response model,\n"
+                   "including the RRT sweeteners, since it carries its own hue and purity model.",
+        .labels = {"Vanilla", "RenoDX", "PsychoV-22"},
         .on_change_value = &OnToneMapLutControlledSettingChanged,
     },
     new renodx::utils::settings::Setting{
@@ -158,8 +192,31 @@ renodx::utils::settings::Settings settings = {
         .default_value = 1.f,
         .label = "Working Color Space",
         .section = "Tone Mapping",
+        .tooltip = "Picks the space the ACES curve runs in.\n"
+                   "Not used by PsychoV-22, which always solves luminance, purity and hue together in LMS.",
         .labels = {"AP1", "LMS"},
-        .is_enabled = []() { return shader_injection.tone_map_type != 0.f; },
+        .is_enabled = []() {
+          return shader_injection.tone_map_type != kToneMapTypeVanilla
+                 && shader_injection.tone_map_type != kToneMapTypePsychoV22;
+        },
+        .on_change_value = &OnToneMapLutControlledSettingChanged,
+    },
+    new renodx::utils::settings::Setting{
+        .key = "ToneMapConeResponse",
+        .binding = &shader_injection.tone_map_cone_response,
+        .default_value = kConeResponseDefault,
+        .label = "Cone Response",
+        .section = "Tone Mapping",
+        .tooltip = "Controls the cone response shaping of PsychoV-22.\n"
+                   "Scales the contrast and purity of the tone curve together and is,\n"
+                   "with the other controls neutral, the log-log slope of the curve at mid gray.\n"
+                   "50 is the slope of the RenoDX curve at this mod's defaults, so the two\n"
+                   "tone mappers line up at mid gray. The RenoDX slope rises with peak\n"
+                   "brightness, so match 48 for 400 nits and 52 for 4000.\n"
+                   "Only available with PsychoV-22.",
+        .max = 100.f,
+        .is_enabled = []() { return shader_injection.tone_map_type == kToneMapTypePsychoV22; },
+        .parse = [](float value) { return (value * kConeResponseStep) + kConeResponseOffset; },
         .on_change_value = &OnToneMapLutControlledSettingChanged,
     },
     new renodx::utils::settings::Setting{
@@ -387,6 +444,7 @@ void OnPresetOff() {
       {"OverrideGameBrightness", 0.f},
       {"ToneMapGameNits", 152.32879f},
       {"ToneMapWorkingColorSpace", 0.f},
+      {"ToneMapConeResponse", kConeResponseDefault},
       {"OverrideUIBrightness", 0.f},
       {"ToneMapUINits", 200.f},
       {"UIEOTFEmulation", 0.f},

@@ -65,8 +65,23 @@ float3 ApplyConeBleaching(
   return (white_at_y + delta) * mid_gray_lms;
 }
 
+// Scene mid gray at the input of the tone curve. The game's LUT domain is
+// scene-linear with 1.0 at 100 nits, which is also what the ACES branch below
+// assumes when its exp-shift system pins 0.18 to ACES_MID.
+static const float PSYCHOV22_SCENE_MID_GRAY = 0.18f;
+
+// Mid gray at the output, relative to diffuse white. The ACES branch lands
+// between 0.0958 and 0.0992 of diffuse white across the whole 400-4000 nit peak
+// range, so PsychoV-22 does not reproduce that drift and uses the RenoDX
+// convention instead. That keeps the curve free of the ACES scaffolding without
+// moving the exposure noticeably.
+static const float PSYCHOV22_DISPLAY_MID_GRAY = 0.10f;
+
+// The LUT builders encode their output with 1.0 at 10000 nits, matching the
+// vanilla ODT path that lives in the same shaders.
+static const float DEADSPACE_LUT_MAX_NITS = 10000.f;
+
 float3 ApplyToneMap(float3 untonemapped_ap1) {
-  const float ACES_MIN = 0.0001f;
   const float ACES_MID = 15.232879f;
   const float ACES_DIFFUSE = ACES_MID * 10.f;
 
@@ -75,89 +90,133 @@ float3 ApplyToneMap(float3 untonemapped_ap1) {
     diffuse_white = RENODX_DIFFUSE_WHITE_NITS;
   }
 
-  float aces_min = ACES_MIN / diffuse_white;
-  float aces_max = (RENODX_PEAK_WHITE_NITS / diffuse_white);
-
-  const float EXP_SHIFT_REFERENCE_MAX = 10000.f;
-  const float EXP_SHIFT_REFERENCE_MIN = 0.0001f;
-
-  renodx::tonemap::aces::ODTConfig odt_config = renodx_custom::tonemap::aces::CreateODTConfig(
-      aces_min * ACES_DIFFUSE, aces_max * ACES_DIFFUSE, ACES_MID, true, EXP_SHIFT_REFERENCE_MAX, EXP_SHIFT_REFERENCE_MIN);
-
+  // Both branches leave the result relative to diffuse white.
   float3 tonemapped_ap1;
-  if (RENODX_TONE_MAP_WORKING_COLOR_SPACE == 0.f) {
-    tonemapped_ap1 = renodx::tonemap::aces::ODTToneMap(untonemapped_ap1, odt_config);
+  if (TONE_MAP_TYPE == DEADSPACE_TONE_MAP_TYPE_PSYCHOV22) {
+    // PsychoV-22 replaces the whole ACES rendering, not just the ODT curve, so
+    // none of the ACES scaffolding is built here: it anchors mid gray itself and
+    // reaches its peak asymptotically, needing neither the exp-shift system nor
+    // an ACES min level. `Working Color Space` picks between the two ACES curve
+    // paths and is inert as well; PsychoV-22 always solves luminance, purity and
+    // hue together in LMS.
+    //
+    // Every grading argument is passed neutral: exposure, highlights, shadows,
+    // contrast, saturation, dechroma and flare all run scene-referred in the
+    // colorgrade passes ahead of this LUT, so feeding them again would grade
+    // twice. Cone Response is the one control that shapes the curve itself: with
+    // the others neutral it is exactly the log-log slope of the curve at the
+    // anchor.
+    float3 tonemapped_bt709 = renodx::tonemap::psychov::psychotm_test22(
+        renodx::color::bt709::from::AP1(untonemapped_ap1),
+        RENODX_PEAK_WHITE_NITS / diffuse_white,
+        1.f,    // exposure (graded before the curve)
+        1.f,    // highlights (graded before the curve)
+        1.f,    // shadows (graded before the curve)
+        1.f,    // contrast (graded before the curve)
+        1.f,    // purity (graded before the curve)
+        1.f,    // bleaching (reserved)
+        100.f,  // clip point (reserved)
+        1.f,    // hue restore (reserved)
+        1.f,    // adaptation contrast (deprecated)
+        0,      // white curve mode (deprecated)
+        RENODX_TONE_MAP_CONE_RESPONSE,
+        PSYCHOV22_SCENE_MID_GRAY.xxx,    // anchor in
+        PSYCHOV22_DISPLAY_MID_GRAY.xxx,  // anchor out
+        1.f,                             // gamut compression
+        // BT.2020 hull instead of BT.709. The composite pass outputs linear
+        // scRGB, which carries the whole BT.2020 volume, and in-hull colors pass
+        // the compression untouched because the soft-compression activation is
+        // zero once the ray parameter reaches the hull. Colors outside BT.709
+        // leave the curve as negative BT.709 values and land back inside AP1
+        // below, since BT.2020 is contained in AP1.
+        1,
+        1.f,   // adaptive normalization (deprecated)
+        0.f);  // 0 = automatic compression
+
+    tonemapped_ap1 = renodx::color::ap1::from::BT709(tonemapped_bt709);
   } else {
-    const float3 AP1_WHITE = renodx::color::lms::from::AP1(1.f);
-    float3 untonemapped_lms = renodx::color::lms::from::AP1(untonemapped_ap1);
-    // untonemapped_lms = ApplyConeBleaching(untonemapped_lms, AP1_WHITE, 1.f, 0.18f, 4.f, 4000.f);
+    const float ACES_MIN = 0.0001f;
 
-    float3 untonemapped_lms_normalized = untonemapped_lms / AP1_WHITE;
-    float3 tonemapped_lms_normalized = renodx::tonemap::aces::ODTToneMap(untonemapped_lms_normalized, odt_config) / ACES_DIFFUSE;
-    float3 tonemapped_lms = max(0, tonemapped_lms_normalized * AP1_WHITE);
+    float aces_min = ACES_MIN / diffuse_white;
+    float aces_max = (RENODX_PEAK_WHITE_NITS / diffuse_white);
 
-    const float MID_GRAY_IN = 0.18f;
-    const float MID_GRAY_OUT = 0.10f;
-    {  // gamut compression
-      float3 current_adaptive_state_lms = AP1_WHITE * MID_GRAY_IN;
-      float3 desired_background_state_lms = AP1_WHITE * MID_GRAY_OUT;
+    const float EXP_SHIFT_REFERENCE_MAX = 10000.f;
+    const float EXP_SHIFT_REFERENCE_MIN = 0.0001f;
 
-      float3 source_relative_weighted = renodx::tonemap::psychov::psycho17_ToAdaptiveRelativeWeightedLMS(
-          untonemapped_lms_normalized * AP1_WHITE,
-          current_adaptive_state_lms);
+    renodx::tonemap::aces::ODTConfig odt_config = renodx_custom::tonemap::aces::CreateODTConfig(
+        aces_min * ACES_DIFFUSE, aces_max * ACES_DIFFUSE, ACES_MID, true, EXP_SHIFT_REFERENCE_MAX, EXP_SHIFT_REFERENCE_MIN);
 
-      float3 display_scaled_relative_weighted = renodx::tonemap::psychov::psycho17_ToAdaptiveRelativeWeightedLMS(
-          tonemapped_lms,
-          desired_background_state_lms);
+    if (RENODX_TONE_MAP_WORKING_COLOR_SPACE == 0.f) {
+      tonemapped_ap1 = renodx::tonemap::aces::ODTToneMap(untonemapped_ap1, odt_config);
+    } else {
+      const float3 AP1_WHITE = renodx::color::lms::from::AP1(1.f);
+      float3 untonemapped_lms = renodx::color::lms::from::AP1(untonemapped_ap1);
+      // untonemapped_lms = ApplyConeBleaching(untonemapped_lms, AP1_WHITE, 1.f, 0.18f, 4.f, 4000.f);
 
-      {
-        float3 mb_source = renodx::color::macleod_boynton::from::WeightedLMS(source_relative_weighted);
-        float3 mb_display_target = renodx::color::macleod_boynton::from::WeightedLMS(display_scaled_relative_weighted);
-        float3 mb_adapted_bg = renodx::color::macleod_boynton::from::LMS(1.f);
+      float3 untonemapped_lms_normalized = untonemapped_lms / AP1_WHITE;
+      float3 tonemapped_lms_normalized = renodx::tonemap::aces::ODTToneMap(untonemapped_lms_normalized, odt_config) / ACES_DIFFUSE;
+      float3 tonemapped_lms = max(0, tonemapped_lms_normalized * AP1_WHITE);
 
-        float2 source_offset = mb_source.xy - mb_adapted_bg.xy;
-        float2 display_target_offset = mb_display_target.xy - mb_adapted_bg.xy;
+      const float MID_GRAY_IN = 0.18f;
+      const float MID_GRAY_OUT = 0.10f;
+      {  // gamut compression
+        float3 current_adaptive_state_lms = AP1_WHITE * MID_GRAY_IN;
+        float3 desired_background_state_lms = AP1_WHITE * MID_GRAY_OUT;
 
-        float src2 = dot(source_offset, source_offset);
-        float display_tgt2 = dot(display_target_offset, display_target_offset);
+        float3 source_relative_weighted = renodx::tonemap::psychov::psycho17_ToAdaptiveRelativeWeightedLMS(
+            untonemapped_lms_normalized * AP1_WHITE,
+            current_adaptive_state_lms);
 
-        if (src2 > 1e-7f && display_tgt2 > 1e-7f) {
-          float target_radius = sqrt(display_tgt2);
-          float2 source_dir = source_offset * rsqrt(src2);
-          float2 display_target_dir = display_target_offset * rsqrt(display_tgt2);
+        float3 display_scaled_relative_weighted = renodx::tonemap::psychov::psycho17_ToAdaptiveRelativeWeightedLMS(
+            tonemapped_lms,
+            desired_background_state_lms);
 
-          float restore_weight = 0.5f;
+        {
+          float3 mb_source = renodx::color::macleod_boynton::from::WeightedLMS(source_relative_weighted);
+          float3 mb_display_target = renodx::color::macleod_boynton::from::WeightedLMS(display_scaled_relative_weighted);
+          float3 mb_adapted_bg = renodx::color::macleod_boynton::from::LMS(1.f);
 
-          float2 blended_dir = lerp(display_target_dir, source_dir, restore_weight);
-          float blended_len2 = dot(blended_dir, blended_dir);
-          blended_dir = (blended_len2 > 1e-7f) ? (blended_dir * rsqrt(blended_len2)) : display_target_dir;
+          float2 source_offset = mb_source.xy - mb_adapted_bg.xy;
+          float2 display_target_offset = mb_display_target.xy - mb_adapted_bg.xy;
 
-          float2 mb_restored_xy = mb_adapted_bg.xy + blended_dir * target_radius;
-          float3 mb_restored = float3(mb_restored_xy, mb_display_target.z);
+          float src2 = dot(source_offset, source_offset);
+          float display_tgt2 = dot(display_target_offset, display_target_offset);
 
-          display_scaled_relative_weighted = renodx::color::macleod_boynton::WeightedLMSFromMacleodBoynton(mb_restored);
+          if (src2 > 1e-7f && display_tgt2 > 1e-7f) {
+            float target_radius = sqrt(display_tgt2);
+            float2 source_dir = source_offset * rsqrt(src2);
+            float2 display_target_dir = display_target_offset * rsqrt(display_tgt2);
+
+            float restore_weight = 0.5f;
+
+            float2 blended_dir = lerp(display_target_dir, source_dir, restore_weight);
+            float blended_len2 = dot(blended_dir, blended_dir);
+            blended_dir = (blended_len2 > 1e-7f) ? (blended_dir * rsqrt(blended_len2)) : display_target_dir;
+
+            float2 mb_restored_xy = mb_adapted_bg.xy + blended_dir * target_radius;
+            float3 mb_restored = float3(mb_restored_xy, mb_display_target.z);
+
+            display_scaled_relative_weighted = renodx::color::macleod_boynton::WeightedLMSFromMacleodBoynton(mb_restored);
+          }
         }
+
+        display_scaled_relative_weighted = renodx::tonemap::psychov::psycho17_GamutCompressAdaptiveRelativeWeightedLMSBound(
+            display_scaled_relative_weighted,
+            desired_background_state_lms,
+            renodx::color::macleod_boynton::BT2020_TO_LMS_WEIGHTED_MAT,
+            1.f);
+
+        tonemapped_lms = renodx::color::macleod_boynton::UnweighLMS(
+            renodx::tonemap::psychov::psycho17_FromAdaptiveRelativeWeightedLMS(display_scaled_relative_weighted, desired_background_state_lms));
       }
 
-      display_scaled_relative_weighted = renodx::tonemap::psychov::psycho17_GamutCompressAdaptiveRelativeWeightedLMSBound(
-          display_scaled_relative_weighted,
-          desired_background_state_lms,
-          renodx::color::macleod_boynton::BT2020_TO_LMS_WEIGHTED_MAT,
-          1.f);
-
-      tonemapped_lms = renodx::color::macleod_boynton::UnweighLMS(
-          renodx::tonemap::psychov::psycho17_FromAdaptiveRelativeWeightedLMS(display_scaled_relative_weighted, desired_background_state_lms));
+      tonemapped_ap1 = renodx::color::ap1::from::LMS(tonemapped_lms) * ACES_DIFFUSE;
     }
 
-    tonemapped_ap1 = renodx::color::ap1::from::LMS(tonemapped_lms) * ACES_DIFFUSE;
+    tonemapped_ap1 /= ACES_DIFFUSE;  // normalize so diffuse white is at 1.0
   }
+
   tonemapped_ap1 = max(0, tonemapped_ap1);
 
-  tonemapped_ap1 /= ACES_DIFFUSE;  // normalize so diffuse white is at 1.0
-
-  tonemapped_ap1 *= diffuse_white;
-
-  tonemapped_ap1 /= EXP_SHIFT_REFERENCE_MAX;
-
-  return tonemapped_ap1;
+  return tonemapped_ap1 * (diffuse_white / DEADSPACE_LUT_MAX_NITS);
 }

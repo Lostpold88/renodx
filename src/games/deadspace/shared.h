@@ -14,6 +14,7 @@ struct ShaderInjectData {
 	float override_game_brightness;
 	float diffuse_white_nits;
 	float tone_map_working_color_space;
+	float tone_map_cone_response;
 	float tone_map_highlights;
 	float tone_map_shadows;
 	float tone_map_contrast;
@@ -46,7 +47,14 @@ cbuffer shader_injection : register(b13) {
 // 4432 = 2500
 // 10081.5 = 4000
 
+// TONE_MAP_TYPE is also the master switch of the RenoDX chain: 0 = Vanilla, any
+// non-zero value enables the RenoDX path and only selects the tone curve
+// (1 = ACES, 2 = PsychoV-22). The name is prefixed to stay clear of the
+// TONE_MAP_TYPE_* constants shaders/draw.hlsl brings in through renodx.hlsl.
+#define DEADSPACE_TONE_MAP_TYPE_PSYCHOV22 2.f
+
 #define TONE_MAP_TYPE                         shader_injection.tone_map_type
+#define RENODX_TONE_MAP_CONE_RESPONSE         shader_injection.tone_map_cone_response
 #define RENODX_TONE_MAP_EXPOSURE             shader_injection.tone_map_exposure
 #define RENODX_GRAPHICS_WHITE_NITS           shader_injection.graphics_white_nits
 #define RENODX_SDR_EOTF_EMULATION_UI         shader_injection.sdr_eotf_emulation_ui
