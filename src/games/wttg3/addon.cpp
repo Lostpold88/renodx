@@ -110,15 +110,14 @@ renodx::utils::settings::Settings settings = {
         .key = "ToneMapType",
         .binding = &shader_injection.tone_map_type,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 2.f,
+        .default_value = 1.f,
         .can_reset = true,
         .label = "Tone Mapper",
         .section = "Tone Mapping",
         .tooltip = "Sets the tone mapper type",
-        .labels = {"Vanilla", "RenoDRT", "PsychoV-30"},
+        .labels = {"Vanilla", "PsychoV-30"},
         .parse = [](float value) {
-          if (value == 1.f) return 3.f;
-          if (value == 2.f) return RENODX_TONE_MAP_TYPE_PSYCHOV30;
+          if (value == 1.f) return RENODX_TONE_MAP_TYPE_PSYCHOV30;
           return 0.f; },
     },
     new renodx::utils::settings::Setting{
@@ -361,11 +360,6 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
         });
 
         // Values for settings that are not exposed in the GUI
-        shader_injection.tone_map_highlight_saturation = 1.f;
-        shader_injection.tone_map_hue_correction = 1.f;
-        shader_injection.tone_map_hue_shift = 0.5f;
-        shader_injection.tone_map_clamp_color_space = -1.f;
-        shader_injection.tone_map_clamp_peak = -1.f;
         shader_injection.swap_chain_clamp_color_space = 1.f;
         shader_injection.swap_chain_encoding = 4.f;
         shader_injection.swap_chain_encoding_color_space = 1.f;
