@@ -31,8 +31,16 @@
 *.out
 *.app
 
-build/**
-build32/**
+build/*
+!build/Release/
+build/Release/*
+!build/Release/*.addon64
+!build/Release/*.addon32
+build32/*
+!build32/Release/
+build32/Release/*
+!build32/Release/*.addon64
+!build32/Release/*.addon32
 build.ninja/**
 build32.ninja/**
 build.vs/**
