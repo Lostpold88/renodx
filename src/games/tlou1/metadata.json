@@ -1,0 +1,22 @@
+{
+  "$schema": "https://cdn.jsdelivr.net/gh/clshortfuse/renodx/renodx-metadata-schema.json",
+  "id": "tlou1",
+  "title": "The Last of Us Part I",
+  "summary": "Replaces the unbounded vanilla HDR output of The Last of Us Part I with a peak-aware PsychoV-30 tone mapper and separate game and UI brightness.",
+  "tags": [
+    "hdr",
+    "tone-mapping"
+  ],
+  "status": "experimental",
+  "notes": [
+    "For HDR output, enable HDR in Windows and in game."
+  ],
+  "deploy": {
+    "steam_appid": 1888930,
+    "game_exe": "tlou-i.exe",
+    "api": "d3d12",
+    "architecture": [
+      "x64"
+    ]
+  }
+}
