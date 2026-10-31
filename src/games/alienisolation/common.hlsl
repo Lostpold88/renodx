@@ -9,13 +9,6 @@ float4 UIScale(float4 color) {
   return color;
 }
 
-float4 FinalizeOutput(float4 color) {
-  color.rgb = renodx::color::gamma::DecodeSafe(color.rgb, 2.2f);
-  color.rgb *= RENODX_DIFFUSE_WHITE_NITS / renodx::color::srgb::REFERENCE_WHITE;
-
-  return color;
-}
-
 float3 ApplyCustomFilmGrain(float3 color, float2 uv) {
   if (CUSTOM_GRAIN_STRENGTH > 0.f) {
     if (CUSTOM_GRAIN_TYPE == 1.f) {  // B&W

@@ -15,9 +15,9 @@ struct ShaderInjectData {
   float tone_map_shadows;
   float tone_map_contrast;
   float tone_map_saturation;
-  float tone_map_highlight_saturation;
+  float psychov_cone_response;
   float tone_map_dechroma;
-  float tone_map_flare;
+  float psychov_gamut_mode;
   float custom_lut_strength;
   float custom_bloom;
   float custom_lens_flare;
@@ -47,9 +47,9 @@ cbuffer cb11 : register(b11) {
 #define RENODX_TONE_MAP_SHADOWS              shader_injection.tone_map_shadows
 #define RENODX_TONE_MAP_CONTRAST             shader_injection.tone_map_contrast
 #define RENODX_TONE_MAP_SATURATION           shader_injection.tone_map_saturation
-#define RENODX_TONE_MAP_HIGHLIGHT_SATURATION shader_injection.tone_map_highlight_saturation
+#define RENODX_PSYCHOV_CONE_RESPONSE         shader_injection.psychov_cone_response
 #define RENODX_TONE_MAP_DECHROMA             shader_injection.tone_map_dechroma
-#define RENODX_TONE_MAP_FLARE                shader_injection.tone_map_flare
+#define RENODX_PSYCHOV_GAMUT_MODE            shader_injection.psychov_gamut_mode
 
 #define CUSTOM_LUT_STRENGTH         shader_injection.custom_lut_strength
 #define CUSTOM_BLOOM                shader_injection.custom_bloom
@@ -63,6 +63,12 @@ cbuffer cb11 : register(b11) {
 #define CUSTOM_RANDOM               shader_injection.custom_random
 #define DEBUG_1                     shader_injection.debug_1
 #define DEBUG_2                     shader_injection.debug_2
+
+// The game outputs gamma 2.2 encoded BT.709. UI is already scaled to diffuse white in game space.
+#define RENODX_SWAP_CHAIN_DECODING             ENCODING_GAMMA_2_2
+#define RENODX_SWAP_CHAIN_SCALING_NITS         RENODX_DIFFUSE_WHITE_NITS
+#define RENODX_SWAP_CHAIN_ENCODING             ENCODING_PQ
+#define RENODX_SWAP_CHAIN_ENCODING_COLOR_SPACE color::convert::COLOR_SPACE_BT2020
 
 #include "../../shaders/renodx.hlsl"
 

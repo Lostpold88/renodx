@@ -25,6 +25,9 @@ namespace {
 ShaderInjectData shader_injection;
 
 static bool HasRGBA16FloatRenderTarget(reshade::api::command_list* cmd_list) {
+  // With the HDR10 swapchain the game still binds its 8-bit back buffer view; its draws are redirected to the float clone
+  if (renodx::utils::swapchain::HasBackBufferRenderTarget(cmd_list)) return true;
+
   const auto& rtvs = renodx::utils::swapchain::GetRenderTargets(cmd_list);
   for (const auto& rtv : rtvs) {
     if (rtv.handle == 0u) continue;
@@ -247,7 +250,7 @@ renodx::utils::settings::Settings settings = {
         .label = "Tone Mapper",
         .section = "Tone Mapping",
         .tooltip = "Sets the tone mapper type",
-        .labels = {"Vanilla", "RenoDX"},
+        .labels = {"Vanilla", "PsychoV-30"},
     },
     new renodx::utils::settings::Setting{
         .key = "ToneMapPeakNits",
@@ -331,12 +334,12 @@ renodx::utils::settings::Settings settings = {
         .parse = [](float value) { return value * 0.02f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "ColorGradeHighlightSaturation",
-        .binding = &shader_injection.tone_map_highlight_saturation,
+        .key = "PsychoVConeResponse",
+        .binding = &shader_injection.psychov_cone_response,
         .default_value = 50.f,
-        .label = "Highlight Saturation",
+        .label = "Cone Response",
         .section = "Color Grading",
-        .tooltip = "Adds or removes highlight color.",
+        .tooltip = "PsychoV cone response. Higher is more contrast, 50 is neutral.",
         .max = 100.f,
         .is_enabled = []() { return shader_injection.tone_map_type != 0; },
         .parse = [](float value) { return value * 0.02f; },
@@ -353,15 +356,15 @@ renodx::utils::settings::Settings settings = {
         .parse = [](float value) { return value * 0.01f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "ColorGradeFlare",
-        .binding = &shader_injection.tone_map_flare,
-        .default_value = 0.f,
-        .label = "Flare",
+        .key = "PsychoVGamutHull",
+        .binding = &shader_injection.psychov_gamut_mode,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 1.f,
+        .label = "Gamut Hull",
         .section = "Color Grading",
-        .tooltip = "Flare/Glare Compensation",
-        .max = 100.f,
+        .tooltip = "Gamut PsychoV-30 compresses colors into. BT.709 keeps the game's colors, BT.2020 allows wider colors.",
+        .labels = {"BT.709", "BT.2020"},
         .is_enabled = []() { return shader_injection.tone_map_type != 0; },
-        .parse = [](float value) { return value * 0.01f; },
     },
     new renodx::utils::settings::Setting{
         .key = "ColorGradeLUTStrength",
@@ -503,9 +506,9 @@ void OnPresetOff() {
   renodx::utils::settings::UpdateSetting("ColorGradeShadows", 50.f);
   renodx::utils::settings::UpdateSetting("ColorGradeContrast", 50.f);
   renodx::utils::settings::UpdateSetting("ColorGradeSaturation", 50.f);
-  renodx::utils::settings::UpdateSetting("ColorGradeHighlightSaturation", 50.f);
+  renodx::utils::settings::UpdateSetting("PsychoVConeResponse", 50.f);
   renodx::utils::settings::UpdateSetting("ColorGradeDechroma", 0.f);
-  renodx::utils::settings::UpdateSetting("ColorGradeFlare", 0.f);
+  renodx::utils::settings::UpdateSetting("PsychoVGamutHull", 1.f);
   renodx::utils::settings::UpdateSetting("ColorGradeLUTStrength", 100.f);
   renodx::utils::settings::UpdateSetting("FxBloom", 100.f);
   renodx::utils::settings::UpdateSetting("FxLensFlare", 100.f);
@@ -515,223 +518,13 @@ void OnPresetOff() {
   alienisolation::aliasisolation::OnPresetOff();
 }
 
-struct __declspec(uuid("95F75086-12B7-4574-BE86-A91EA9390802")) DeviceData {
-  std::vector<reshade::api::resource_view> swapchain_rtvs;
-  reshade::api::pipeline final_pipeline = {};
-  reshade::api::resource final_texture = {};
-  reshade::api::resource_view final_texture_view = {};
-  reshade::api::sampler final_texture_sampler = {};
-  reshade::api::pipeline_layout final_layout = {};
-};
-
-constexpr reshade::api::pipeline_layout PIPELINE_LAYOUT{0};
-
-void OnInitDevice(reshade::api::device* device) {
-  auto* data = device->create_private_data<DeviceData>();
-
-  {
-    std::vector<reshade::api::pipeline_subobject> subobjects;
-
-    reshade::api::shader_desc vs_desc = {};
-    vs_desc.code = __swap_chain_proxy_vertex_shader.data();
-    vs_desc.code_size = __swap_chain_proxy_vertex_shader.size();
-    subobjects.push_back({reshade::api::pipeline_subobject_type::vertex_shader, 1, &vs_desc});
-
-    reshade::api::shader_desc ps_desc = {};
-    ps_desc.code = __swap_chain_proxy_pixel_shader.data();
-    ps_desc.code_size = __swap_chain_proxy_pixel_shader.size();
-    subobjects.push_back({reshade::api::pipeline_subobject_type::pixel_shader, 1, &ps_desc});
-
-    reshade::api::format format = reshade::api::format::r16g16b16a16_float;
-    subobjects.push_back({reshade::api::pipeline_subobject_type::render_target_formats, 1, &format});
-
-    uint32_t num_vertices = 3;
-    subobjects.push_back({reshade::api::pipeline_subobject_type::max_vertex_count, 1, &num_vertices});
-
-    auto topology = reshade::api::primitive_topology::triangle_list;
-    subobjects.push_back({reshade::api::pipeline_subobject_type::primitive_topology, 1, &topology});
-
-    reshade::api::blend_desc blend_state = {};
-    subobjects.push_back({reshade::api::pipeline_subobject_type::blend_state, 1, &blend_state});
-
-    reshade::api::rasterizer_desc rasterizer_state = {};
-    rasterizer_state.cull_mode = reshade::api::cull_mode::none;
-    subobjects.push_back({reshade::api::pipeline_subobject_type::rasterizer_state, 1, &rasterizer_state});
-
-    reshade::api::depth_stencil_desc depth_stencil_state = {};
-    depth_stencil_state.depth_enable = false;
-    depth_stencil_state.depth_write_mask = false;
-    depth_stencil_state.depth_func = reshade::api::compare_op::always;
-    depth_stencil_state.stencil_enable = false;
-    depth_stencil_state.front_stencil_read_mask = 0xFF;
-    depth_stencil_state.front_stencil_write_mask = 0xFF;
-    depth_stencil_state.front_stencil_func = depth_stencil_state.back_stencil_func;
-    depth_stencil_state.front_stencil_fail_op = depth_stencil_state.back_stencil_fail_op;
-    depth_stencil_state.front_stencil_depth_fail_op = depth_stencil_state.back_stencil_depth_fail_op;
-    depth_stencil_state.front_stencil_pass_op = depth_stencil_state.back_stencil_pass_op;
-    depth_stencil_state.back_stencil_read_mask = 0xFF;
-    depth_stencil_state.back_stencil_write_mask = 0xFF;
-    depth_stencil_state.back_stencil_func = reshade::api::compare_op::always;
-    depth_stencil_state.back_stencil_fail_op = reshade::api::stencil_op::keep;
-    depth_stencil_state.back_stencil_depth_fail_op = reshade::api::stencil_op::keep;
-    depth_stencil_state.back_stencil_pass_op = reshade::api::stencil_op::keep;
-    subobjects.push_back({reshade::api::pipeline_subobject_type::depth_stencil_state, 1, &depth_stencil_state});
-
-    device->create_pipeline(PIPELINE_LAYOUT, static_cast<uint32_t>(subobjects.size()), subobjects.data(), &data->final_pipeline);
-  }
-
-  {
-    reshade::api::pipeline_layout_param params = {};
-    params.type = reshade::api::pipeline_layout_param_type::push_constants;
-    params.push_constants.count = sizeof(shader_injection) / 4;
-    params.push_constants.dx_register_index = 11;
-    params.push_constants.visibility = reshade::api::shader_stage::all_graphics;
-    device->create_pipeline_layout(1, &params, &data->final_layout);
-  }
-}
-
-void OnDestroyDevice(reshade::api::device* device) {
-  auto* data = device->get_private_data<DeviceData>();
-  if (data == nullptr) return;
-
-  device->destroy_pipeline(data->final_pipeline);
-  device->destroy_pipeline_layout(data->final_layout);
-
-  device->destroy_private_data<DeviceData>();
-}
-
 bool fired_on_init_swapchain = false;
 
 void OnInitSwapchain(reshade::api::swapchain* swapchain, bool resize) {
-  auto* device = swapchain->get_device();
-  auto* data = device->get_private_data<DeviceData>();
-  if (data == nullptr) return;
+  if (fired_on_init_swapchain) return;
+  fired_on_init_swapchain = true;
 
-  if (!fired_on_init_swapchain) {
-    fired_on_init_swapchain = true;
-
-    auto peak = renodx::utils::swapchain::GetPeakNits(swapchain);
-    if (!peak.has_value()) {
-      peak = 1000.f;
-    }
-    settings[1]->default_value = peak.value();
-  }
-
-  for (uint32_t i = 0; i < swapchain->get_back_buffer_count(); ++i) {
-    auto back_buffer_resource = swapchain->get_back_buffer(i);
-    auto back_buffer_desc = device->get_resource_desc(back_buffer_resource);
-    auto desc = reshade::api::resource_view_desc(
-        reshade::api::resource_view_type::texture_2d,
-        reshade::api::format_to_default_typed(back_buffer_desc.texture.format),
-        0,
-        1,
-        0,
-        1);
-    device->create_resource_view(back_buffer_resource, reshade::api::resource_usage::render_target, desc, &data->swapchain_rtvs.emplace_back());
-  }
-
-  {
-    auto back_buffer_resource = swapchain->get_back_buffer(0);
-    auto back_buffer_desc = device->get_resource_desc(back_buffer_resource);
-    reshade::api::resource_desc desc = {};
-    desc.type = reshade::api::resource_type::texture_2d;
-    desc.texture = {
-        back_buffer_desc.texture.width,
-        back_buffer_desc.texture.height,
-        1,
-        1,
-        reshade::api::format_to_typeless(back_buffer_desc.texture.format),
-        1,
-    };
-    desc.heap = reshade::api::memory_heap::gpu_only;
-    desc.usage = reshade::api::resource_usage::copy_dest | reshade::api::resource_usage::shader_resource;
-    desc.flags = reshade::api::resource_flags::none;
-    device->create_resource(desc, nullptr, reshade::api::resource_usage::shader_resource, &data->final_texture);
-    device->create_resource_view(
-        data->final_texture,
-        reshade::api::resource_usage::shader_resource,
-        reshade::api::resource_view_desc(reshade::api::format_to_default_typed(desc.texture.format)),
-        &data->final_texture_view);
-    device->create_sampler({}, &data->final_texture_sampler);
-  }
-}
-
-void OnDestroySwapchain(reshade::api::swapchain* swapchain, bool resize) {
-  auto* device = swapchain->get_device();
-  auto* data = device->get_private_data<DeviceData>();
-  if (data == nullptr) return;
-
-  for (const auto& rtv : data->swapchain_rtvs) {
-    device->destroy_resource_view(rtv);
-  }
-  data->swapchain_rtvs.clear();
-
-  device->destroy_sampler(data->final_texture_sampler);
-  device->destroy_resource_view(data->final_texture_view);
-  device->destroy_resource(data->final_texture);
-
-  data->final_texture_sampler = {};
-  data->final_texture_view = {};
-  data->final_texture = {};
-}
-
-void OnPresent(
-    reshade::api::command_queue* queue,
-    reshade::api::swapchain* swapchain,
-    const reshade::api::rect* source_rect,
-    const reshade::api::rect* dest_rect,
-    uint32_t dirty_rect_count,
-    const reshade::api::rect* dirty_rects) {
-  auto* device = queue->get_device();
-  auto* cmd_list = queue->get_immediate_command_list();
-  auto* data = device->get_private_data<DeviceData>();
-  if (data == nullptr || data->final_texture.handle == 0) return;
-
-  auto back_buffer_resource = swapchain->get_current_back_buffer();
-  auto back_buffer_desc = device->get_resource_desc(back_buffer_resource);
-
-  {
-    const reshade::api::resource resources[2] = {back_buffer_resource, data->final_texture};
-    const reshade::api::resource_usage state_old[2] = {reshade::api::resource_usage::render_target, reshade::api::resource_usage::shader_resource};
-    const reshade::api::resource_usage state_new[2] = {reshade::api::resource_usage::copy_source, reshade::api::resource_usage::copy_dest};
-
-    cmd_list->barrier(2, resources, state_old, state_new);
-    cmd_list->copy_texture_region(back_buffer_resource, 0, nullptr, data->final_texture, 0, nullptr);
-    cmd_list->barrier(2, resources, state_new, state_old);
-  }
-
-  cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_graphics, data->final_pipeline);
-  cmd_list->barrier(back_buffer_resource, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::render_target);
-
-  reshade::api::render_pass_render_target_desc render_target = {};
-  render_target.view = data->swapchain_rtvs.at(swapchain->get_current_back_buffer_index());
-  cmd_list->begin_render_pass(1, &render_target, nullptr);
-
-  cmd_list->push_descriptors(
-      reshade::api::shader_stage::all_graphics,
-      PIPELINE_LAYOUT,
-      0,
-      reshade::api::descriptor_table_update{{}, 0, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &data->final_texture_view});
-  cmd_list->push_descriptors(
-      reshade::api::shader_stage::all_graphics,
-      PIPELINE_LAYOUT,
-      0,
-      reshade::api::descriptor_table_update{{}, 0, 0, 1, reshade::api::descriptor_type::sampler, &data->final_texture_sampler});
-
-  cmd_list->push_constants(reshade::api::shader_stage::all_graphics, data->final_layout, 0, 0, sizeof(shader_injection) / 4, &shader_injection);
-
-  const reshade::api::viewport viewport = {
-      0.0f,
-      0.0f,
-      static_cast<float>(back_buffer_desc.texture.width),
-      static_cast<float>(back_buffer_desc.texture.height),
-      0.0f,
-      1.0f};
-  cmd_list->bind_viewports(0, 1, &viewport);
-
-  cmd_list->draw(3, 1, 0, 0);
-  cmd_list->end_render_pass();
-  cmd_list->barrier(back_buffer_resource, reshade::api::resource_usage::render_target, reshade::api::resource_usage::shader_resource);
+  settings[1]->default_value = renodx::utils::swapchain::GetPeakNits(swapchain).value_or(1000.f);
 }
 
 }  // namespace
@@ -751,7 +544,11 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       renodx::mods::shader::expected_constant_buffer_index = 11;
       // renodx::mods::shader::force_pipeline_cloning = true;
 
+      renodx::mods::swapchain::expected_constant_buffer_index = 11;
       renodx::mods::swapchain::use_resource_cloning = true;
+      renodx::mods::swapchain::swap_chain_proxy_vertex_shader = __swap_chain_proxy_vertex_shader;
+      renodx::mods::swapchain::swap_chain_proxy_pixel_shader = __swap_chain_proxy_pixel_shader;
+      renodx::mods::swapchain::SetUseHDR10(true);
 
       // Tonemap + SMAA T1x / T2x
       // breaks resource views used to linearize the image during AA
@@ -771,20 +568,12 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
           .dimensions = {.width = renodx::utils::resource::ResourceUpgradeInfo::BACK_BUFFER, .height = renodx::utils::resource::ResourceUpgradeInfo::BACK_BUFFER},
       });
 
-      reshade::register_event<reshade::addon_event::init_device>(OnInitDevice);
-      reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
       reshade::register_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
-      reshade::register_event<reshade::addon_event::destroy_swapchain>(OnDestroySwapchain);
-      reshade::register_event<reshade::addon_event::present>(OnPresent);
 
       break;
     case DLL_PROCESS_DETACH:
       reshade::unregister_addon(h_module);
-      reshade::unregister_event<reshade::addon_event::init_device>(OnInitDevice);
-      reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
       reshade::unregister_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
-      reshade::unregister_event<reshade::addon_event::destroy_swapchain>(OnDestroySwapchain);
-      reshade::unregister_event<reshade::addon_event::present>(OnPresent);
 
       break;
   }
@@ -792,7 +581,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
   alienisolation::aliasisolation::Use(fdw_reason, &shader_injection);
   renodx::utils::random::Use(fdw_reason);  // film grain
   renodx::utils::settings::Use(fdw_reason, &settings, &OnPresetOff);
-  renodx::mods::swapchain::Use(fdw_reason);
+  renodx::mods::swapchain::Use(fdw_reason, &shader_injection);
   renodx::mods::shader::Use(fdw_reason, custom_shaders, &shader_injection);
 
   return TRUE;

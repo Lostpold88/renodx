@@ -2,7 +2,6 @@
 #include "./include/CBuffer_DefaultPSC.hlsl"
 #include "./include/CBuffer_DefaultXSC.hlsl"
 #include "./include/CBuffer_UbershaderXSC.hlsl"
-#include "./psycho_test17_custom.hlsli"
 
 // 3Dmigoto declarations
 #define cmp -
@@ -599,32 +598,33 @@ float4 FinalizeToneMapOutput(float3 input_color) {
 
   if (RENODX_TONE_MAP_TYPE != 0) {
     output_color.rgb = renodx::color::gamma::DecodeSafe(output_color.rgb);
-    output_color.rgb = renodx::color::bt2020::from::BT709(output_color.rgb);
     output_color.rgb = max(0, output_color.rgb);
 
-    renodx_custom::tonemap::psycho::config17::Config psycho17_config =
-        renodx_custom::tonemap::psycho::config17::Create();
-    psycho17_config.peak_value = RENODX_PEAK_WHITE_NITS / RENODX_DIFFUSE_WHITE_NITS;
-    psycho17_config.clip_point = 100.f;
-    psycho17_config.exposure = RENODX_TONE_MAP_EXPOSURE;
-    psycho17_config.gamma = 1.f;
-    psycho17_config.highlights = RENODX_TONE_MAP_HIGHLIGHTS;
-    psycho17_config.shadows = RENODX_TONE_MAP_SHADOWS;
-    psycho17_config.contrast = RENODX_TONE_MAP_CONTRAST;
-    psycho17_config.flare = 0.10f * pow(RENODX_TONE_MAP_FLARE, 10.f);
-    psycho17_config.contrast_highlights = 1.f;
-    psycho17_config.contrast_shadows = 1.f;
-    psycho17_config.purity_scale = RENODX_TONE_MAP_SATURATION;
-    psycho17_config.purity_highlights = -1.f * (RENODX_TONE_MAP_HIGHLIGHT_SATURATION - 1.f);
-    psycho17_config.dechroma = RENODX_TONE_MAP_DECHROMA;
-    psycho17_config.adaptation_contrast = 1.f;
-    psycho17_config.bleaching_intensity = 0.f;
-    psycho17_config.hue_emulation = 0.f;
-    psycho17_config.pre_gamut_compress = false;
-    psycho17_config.post_gamut_compress = true;
-    output_color.rgb = renodx_custom::tonemap::psycho::ApplyTest17BT2020(output_color.rgb, output_color.rgb, psycho17_config);
+    // Input is already the extrapolated vanilla tonemap, so the mid gray anchors stay at identity
+    output_color.rgb = renodx::tonemap::psychov::psychotm_test30(
+        output_color.rgb,
+        max(1.f, RENODX_PEAK_WHITE_NITS / RENODX_DIFFUSE_WHITE_NITS),
+        RENODX_TONE_MAP_EXPOSURE,
+        RENODX_TONE_MAP_HIGHLIGHTS,
+        RENODX_TONE_MAP_SHADOWS,
+        RENODX_TONE_MAP_CONTRAST,
+        RENODX_TONE_MAP_SATURATION,
+        0.f,
+        100.f,
+        1.f,
+        1.f,
+        1,
+        max(0.01f, RENODX_PSYCHOV_CONE_RESPONSE),
+        0.18f,
+        0.18f,
+        1.f,
+        (int)RENODX_PSYCHOV_GAMUT_MODE,
+        1.f,
+        1.f,
+        renodx::tonemap::psychov::PSYCHO30_SOURCE_BOUNDARY_BT709);
 
-    output_color.rgb = renodx::color::bt709::from::BT2020(output_color.rgb);
+    // psychotm_test30 has no blowout input, so dechroma is applied as blowout afterwards
+    output_color.rgb = renodx::color::grade::UserColorGrading(output_color.rgb, 1.f, 1.f, 1.f, 1.f, 1.f, RENODX_TONE_MAP_DECHROMA, 0.f);
     output_color.rgb = renodx::color::gamma::EncodeSafe(output_color.rgb);
   } else {
     output_color = max(0, output_color);
