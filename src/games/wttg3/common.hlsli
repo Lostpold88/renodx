@@ -72,48 +72,12 @@ float3 ToneMapLut(float3 untonemapped, float3 graded_sdr_encoded, Texture3D<floa
     peak_value = renodx::color::correct::Gamma(peak_value, true, 2.4f);
   }
 
-  float3 graded_untonemapped = renodx::draw::ComputeUntonemappedGraded(untonemapped, graded_sdr, neutral_sdr) * RENODX_TONE_MAP_EXPOSURE;
-  float3 input_lms = mul(renodx::tonemap::psychov::PSYCHO35_BT709_TO_LMS_MAT, graded_untonemapped);
-  float input_yf = renodx::color::yf::from::LMS(input_lms);
-  if (!(input_yf > 0.f)) {
-    return renodx::draw::RenderIntermediatePass(0.f);
-  }
-  if (any(input_lms < 0.f)) {
-    float3 neutral_lms = (input_yf / renodx::tonemap::psychov::PSYCHO35_D65_WHITE_YF) * renodx::tonemap::psychov::PSYCHO35_D65_WHITE_LMS;
-    float3 delta_lms = input_lms - neutral_lms;
-    float t = 1.f;
-    if (delta_lms.x < 0.f) t = min(t, -neutral_lms.x / delta_lms.x);
-    if (delta_lms.y < 0.f) t = min(t, -neutral_lms.y / delta_lms.y);
-    if (delta_lms.z < 0.f) t = min(t, -neutral_lms.z / delta_lms.z);
-    input_lms = max(0.f, neutral_lms + saturate(t) * delta_lms);
-    graded_untonemapped = mul(renodx::tonemap::psychov::PSYCHO35_LMS_TO_BT709_MAT, input_lms);
-  }
-  if (RENODX_TONE_MAP_HIGHLIGHTS != 1.f || RENODX_TONE_MAP_SHADOWS != 1.f) {
-    float anchor_yf = MID_GRAY * renodx::tonemap::psychov::PSYCHO35_D65_WHITE_YF;
-    float target_y = input_yf;
-    if (RENODX_TONE_MAP_HIGHLIGHTS != 1.f) {
-      float x = saturate((target_y - anchor_yf) / anchor_yf);
-      float w = x * x * x * (x * (x * 6.f - 15.f) + 10.f);
-      float ratio = max(target_y / anchor_yf, 0.f);
-      float shaped_y = anchor_yf * pow(ratio, RENODX_TONE_MAP_HIGHLIGHTS) + (target_y - anchor_yf);
-      target_y = max(0.f, lerp(target_y, shaped_y, w));
-    }
-    if (RENODX_TONE_MAP_SHADOWS != 1.f) {
-      float x = saturate((anchor_yf - target_y) / anchor_yf);
-      float w = x * x * x * (x * (x * 6.f - 15.f) + 10.f);
-      float ratio = max(target_y / anchor_yf, 0.f);
-      float shaped_y = anchor_yf * pow(ratio, 2.f - RENODX_TONE_MAP_SHADOWS) + (target_y - anchor_yf);
-      target_y = max(0.f, lerp(target_y, shaped_y, w));
-    }
-    graded_untonemapped *= target_y / input_yf;
-  }
-
-  float3 tonemapped = renodx::tonemap::psychov::psychotm_test35(
-      graded_untonemapped,
+  float3 tonemapped = renodx::tonemap::psychov::psychotm_test30(
+      renodx::draw::ComputeUntonemappedGraded(untonemapped, graded_sdr, neutral_sdr),
       peak_value,
-      1.f,
-      1.f,
-      1.f,
+      RENODX_TONE_MAP_EXPOSURE,
+      RENODX_TONE_MAP_HIGHLIGHTS,
+      RENODX_TONE_MAP_SHADOWS,
       RENODX_TONE_MAP_CONTRAST,
       RENODX_TONE_MAP_SATURATION,
       0.f,
@@ -130,7 +94,7 @@ float3 ToneMapLut(float3 untonemapped, float3 graded_sdr_encoded, Texture3D<floa
       clamp(RENODX_PSYCHOV_COMPRESSION, 0.f, 2.f),
       (int)RENODX_PSYCHOV_SOURCE_BOUNDARY);
 
-  // psychotm_test35 has no blowout input (that slot is a placeholder), so apply it as the dechroma
+  // psychotm_test30 has no blowout input (that slot is a placeholder), so apply it as the dechroma
   tonemapped = renodx::color::grade::UserColorGrading(tonemapped, 1.f, 1.f, 1.f, 1.f, 1.f, RENODX_TONE_MAP_BLOWOUT, 0.f);
   return renodx::draw::RenderIntermediatePass(tonemapped);
 }
