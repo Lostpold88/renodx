@@ -50,8 +50,15 @@ float3 ToneMapLut(float3 untonemapped, float3 graded_sdr_encoded, Texture3D<floa
     peak_value = renodx::color::correct::Gamma(peak_value, true, 2.4f);
   }
 
-  float3 tonemapped = renodx::tonemap::psychov::psychotm_test30(
-      renodx::draw::ComputeUntonemappedGraded(untonemapped, graded_sdr, neutral_sdr),
+  const float3 graded_untonemapped = renodx::draw::ComputeUntonemappedGraded(untonemapped, graded_sdr, neutral_sdr);
+
+  // PsychoV-35 conditioning needs a positive mean cone signal; black has nothing to tonemap.
+  if (!(renodx::color::yf::from::LMS(mul(renodx::tonemap::psychov::PSYCHO35_BT709_TO_LMS_MAT, graded_untonemapped)) > 0.f)) {
+    return renodx::draw::RenderIntermediatePass(0.f.xxx);
+  }
+
+  float3 tonemapped = renodx::tonemap::psychov::psychotm_test35(
+      graded_untonemapped,
       peak_value,
       RENODX_TONE_MAP_EXPOSURE,
       RENODX_TONE_MAP_HIGHLIGHTS,
@@ -70,9 +77,10 @@ float3 ToneMapLut(float3 untonemapped, float3 graded_sdr_encoded, Texture3D<floa
       (int)RENODX_PSYCHOV_GAMUT_MODE,
       1.f,
       clamp(RENODX_PSYCHOV_COMPRESSION, 0.f, 2.f),
-      (int)RENODX_PSYCHOV_SOURCE_BOUNDARY);
+      (int)RENODX_PSYCHOV_SOURCE_BOUNDARY,
+      true);  // human_gamut_conditioning: the LUT grade delta can push cones negative, test35 conditions and floors them
 
-  // psychotm_test30 has no blowout input (that slot is a placeholder), so apply it as the dechroma
+  // psychotm_test35 has no blowout input (that slot is a placeholder), so apply it as the dechroma
   tonemapped = renodx::color::grade::UserColorGrading(tonemapped, 1.f, 1.f, 1.f, 1.f, 1.f, RENODX_TONE_MAP_BLOWOUT, 0.f);
   return renodx::draw::RenderIntermediatePass(tonemapped);
 }
