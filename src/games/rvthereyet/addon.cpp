@@ -37,9 +37,9 @@ renodx::utils::settings::Settings settings = {
         .label = "Tone Mapper",
         .section = "Tone Mapping",
         .tooltip = "Sets the tone mapper type",
-        .labels = {"Vanilla", "PsychoV-30"},
+        .labels = {"Vanilla", "PsychoV-35"},
         .parse = [](float value) {
-          if (value == 1.f) return RENODX_TONE_MAP_TYPE_PSYCHOV30;
+          if (value == 1.f) return RENODX_TONE_MAP_TYPE_PSYCHOV35;
           return 0.f; },
     },
     new renodx::utils::settings::Setting{
@@ -92,7 +92,7 @@ renodx::utils::settings::Settings settings = {
         .tooltip = "PsychoV cone response. Higher is more contrast, 50 is neutral.",
         .min = 0.f,
         .max = 100.f,
-        .is_enabled = []() { return shader_injection.tone_map_type == RENODX_TONE_MAP_TYPE_PSYCHOV30; },
+        .is_enabled = []() { return shader_injection.tone_map_type == RENODX_TONE_MAP_TYPE_PSYCHOV35; },
         .parse = [](float value) { return value * 0.02f; },
     },
     new renodx::utils::settings::Setting{
@@ -102,9 +102,9 @@ renodx::utils::settings::Settings settings = {
         .default_value = 1.f,
         .label = "Gamut Hull",
         .section = "Tone Mapping",
-        .tooltip = "Gamut PsychoV-30 compresses colors into. BT.709 keeps the game's colors, BT.2020 allows wider colors.",
+        .tooltip = "Gamut PsychoV-35 compresses colors into. BT.709 keeps the game's colors, BT.2020 allows wider colors.",
         .labels = {"BT.709", "BT.2020"},
-        .is_enabled = []() { return shader_injection.tone_map_type == RENODX_TONE_MAP_TYPE_PSYCHOV30; },
+        .is_enabled = []() { return shader_injection.tone_map_type == RENODX_TONE_MAP_TYPE_PSYCHOV35; },
     },
     new renodx::utils::settings::Setting{
         .key = "ColorGradeExposure",
@@ -279,7 +279,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
         shader_injection.psychov_gamut_compression = 1.f;
         shader_injection.psychov_compression = 1.f;
         shader_injection.psychov_cone_response = 1.f;
-        // Fixed BT.2020 source gamut (PSYCHO30_SOURCE_BOUNDARY_BT2020)
+        // Fixed BT.2020 source gamut (PSYCHO35_SOURCE_BOUNDARY_BT2020)
         shader_injection.psychov_source_boundary = 2.f;
 
         initialized = true;

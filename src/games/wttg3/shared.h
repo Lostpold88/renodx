@@ -25,7 +25,7 @@
 // #define RENODX_SWAP_CHAIN_ENCODING             ENCODING_SCRGB
 // #define RENODX_SWAP_CHAIN_ENCODING_COLOR_SPACE color::convert::COLOR_SPACE_BT709
 
-#define RENODX_TONE_MAP_TYPE_PSYCHOV30 8.f
+#define RENODX_TONE_MAP_TYPE_PSYCHOV35 8.f
 
 // Must be 32bit aligned
 // Should be 4x32
