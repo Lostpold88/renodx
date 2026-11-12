@@ -551,8 +551,9 @@ function(build_shader_target ADDON ADDON_PATH)
     find_program(SPIRV_VAL_BIN NAMES spirv-val.exe spirv-val
       HINTS "${CMAKE_SOURCE_DIR}/bin" "$ENV{VULKAN_SDK}/Bin")
     if(NOT SPIRV_AS_BIN OR NOT SPIRV_VAL_BIN)
-      message(FATAL_ERROR
-        "SPIR-V assembly requires spirv-as and spirv-val from SPIRV-Tools. Set SPIRV_AS_BIN and SPIRV_VAL_BIN to the installed tools.")
+      message(WARNING
+        "SPIR-V assembly requires spirv-as and spirv-val from SPIRV-Tools; skipping .spvasm shaders for ${ADDON}.")
+      set(SHADER_SPVASM_SOURCES "")
     endif()
   endif()
   foreach(FILE IN LISTS SHADER_SPVASM_SOURCES)
