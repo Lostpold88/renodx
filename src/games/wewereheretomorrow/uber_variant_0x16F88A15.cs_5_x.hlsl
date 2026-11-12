@@ -168,6 +168,8 @@ void main(uint3 vThreadID : SV_DispatchThreadID)
       if (RENODX_TONE_MAP_TYPE != 0.f) {
         r2.xyz = ToneMapLut(untonemapped, r2.xyz, t4, s2_s, cb1[6]);
       }
+    } else if (RENODX_TONE_MAP_TYPE != 0.f) {
+      r2.xyz = ApplyPsychoV35(r2.xyz);
     }
   }
   u0[vThreadID] = r2.xyzx;
