@@ -600,32 +600,38 @@ float4 FinalizeToneMapOutput(float3 input_color) {
     output_color.rgb = renodx::color::gamma::DecodeSafe(output_color.rgb);
     output_color.rgb = max(0, output_color.rgb);
 
-    // Input is already the extrapolated vanilla tonemap, so the mid gray anchors stay at identity
-    output_color.rgb = renodx::tonemap::psychov::psychotm_test30(
-        output_color.rgb,
-        max(1.f, RENODX_PEAK_WHITE_NITS / RENODX_DIFFUSE_WHITE_NITS),
-        RENODX_TONE_MAP_EXPOSURE,
-        RENODX_TONE_MAP_HIGHLIGHTS,
-        RENODX_TONE_MAP_SHADOWS,
-        RENODX_TONE_MAP_CONTRAST,
-        RENODX_TONE_MAP_SATURATION,
-        0.f,
-        100.f,
-        1.f,
-        1.f,
-        1,
-        max(0.01f, RENODX_PSYCHOV_CONE_RESPONSE),
-        0.18f,
-        0.18f,
-        1.f,
-        (int)RENODX_PSYCHOV_GAMUT_MODE,
-        1.f,
-        1.f,
-        renodx::tonemap::psychov::PSYCHO30_SOURCE_BOUNDARY_BT709);
+    // PsychoV-35 conditioning needs a positive mean cone signal; black has nothing to tonemap.
+    if (!(renodx::color::yf::from::LMS(mul(renodx::tonemap::psychov::PSYCHO35_BT709_TO_LMS_MAT, output_color.rgb)) > 0.f)) {
+      output_color.rgb = 0.f;
+    } else {
+      // Input is already the extrapolated vanilla tonemap, so the mid gray anchors stay at identity
+      output_color.rgb = renodx::tonemap::psychov::psychotm_test35(
+          output_color.rgb,
+          max(1.f, RENODX_PEAK_WHITE_NITS / RENODX_DIFFUSE_WHITE_NITS),
+          RENODX_TONE_MAP_EXPOSURE,
+          RENODX_TONE_MAP_HIGHLIGHTS,
+          RENODX_TONE_MAP_SHADOWS,
+          RENODX_TONE_MAP_CONTRAST,
+          RENODX_TONE_MAP_SATURATION,
+          0.f,
+          100.f,
+          1.f,
+          1.f,
+          1,
+          max(0.01f, RENODX_PSYCHOV_CONE_RESPONSE),
+          0.18f,
+          0.18f,
+          1.f,
+          (int)RENODX_PSYCHOV_GAMUT_MODE,
+          1.f,
+          1.f,
+          renodx::tonemap::psychov::PSYCHO35_SOURCE_BOUNDARY_BT709,
+          true);
 
-    // psychotm_test30 has no blowout input, so dechroma is applied as blowout afterwards
-    output_color.rgb = renodx::color::grade::UserColorGrading(output_color.rgb, 1.f, 1.f, 1.f, 1.f, 1.f, RENODX_TONE_MAP_DECHROMA, 0.f);
-    output_color.rgb = renodx::color::gamma::EncodeSafe(output_color.rgb);
+      // psychotm_test35 has no blowout input (that slot is a placeholder), so dechroma is applied as blowout afterwards
+      output_color.rgb = renodx::color::grade::UserColorGrading(output_color.rgb, 1.f, 1.f, 1.f, 1.f, 1.f, RENODX_TONE_MAP_DECHROMA, 0.f);
+      output_color.rgb = renodx::color::gamma::EncodeSafe(output_color.rgb);
+    }
   } else {
     output_color = max(0, output_color);
   }

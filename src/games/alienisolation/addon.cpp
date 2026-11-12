@@ -250,7 +250,7 @@ renodx::utils::settings::Settings settings = {
         .label = "Tone Mapper",
         .section = "Tone Mapping",
         .tooltip = "Sets the tone mapper type",
-        .labels = {"Vanilla", "PsychoV-30"},
+        .labels = {"Vanilla", "PsychoV-35"},
     },
     new renodx::utils::settings::Setting{
         .key = "ToneMapPeakNits",
@@ -362,7 +362,7 @@ renodx::utils::settings::Settings settings = {
         .default_value = 1.f,
         .label = "Gamut Hull",
         .section = "Color Grading",
-        .tooltip = "Gamut PsychoV-30 compresses colors into. BT.709 keeps the game's colors, BT.2020 allows wider colors.",
+        .tooltip = "Gamut PsychoV-35 compresses colors into. BT.709 keeps the game's colors, BT.2020 allows wider colors.",
         .labels = {"BT.709", "BT.2020"},
         .is_enabled = []() { return shader_injection.tone_map_type != 0; },
     },

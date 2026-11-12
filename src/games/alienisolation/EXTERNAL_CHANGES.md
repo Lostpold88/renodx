@@ -22,7 +22,7 @@ Apply by copying the two hunks from the author's working tree, or re-implement a
 
 - Swapchain is HDR10 (`SetUseHDR10(true)`, PQ / BT.2020). The old hand-written `OnPresent` proxy was removed in favor of
   the library proxy (`swap_chain_proxy_*_shader`, `expected_constant_buffer_index = 11`).
-- Tone mapper is PsychoV-30 (`renodx::tonemap::psychov::psychotm_test30`); `psycho_test17_custom.hlsli` was removed.
+- Tone mapper is PsychoV-35 (`renodx::tonemap::psychov::psychotm_test35`); `psycho_test17_custom.hlsli` was removed.
 - UI replacement shaders now also match when the game draws to the back buffer (`HasBackBufferRenderTarget`), because
   the game keeps its 8-bit view while the draw is redirected to the float clone.
 - Build with the x86 preset: `cmake --preset clang-x86`, then `cmake --build build32 --config Release --target renodx-alienisolation.addon32`.
