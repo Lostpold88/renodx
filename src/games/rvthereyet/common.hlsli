@@ -24,6 +24,58 @@ float VanillaGrayCurve(Texture3D<float4> lut, SamplerState lut_sampler, float2 l
   return renodx::color::y::from::BT709(VanillaLutLinear(lut.SampleLevel(lut_sampler, float3(coord, coord, coord), 0).xyz));
 }
 
+float3 ApplyPsychoV35(float3 untonemapped_color, float anchor_out = MID_GRAY, float vanilla_cone = 1.f) {
+  float3 tonemapped = 0.f.xxx;
+
+  const bool input_finite = all((asuint(untonemapped_color) & 0x7f800000u) != 0x7f800000u);
+  const float3 input_lms = mul(renodx::tonemap::psychov::PSYCHO35_BT709_TO_LMS_MAT, untonemapped_color);
+  const float3 anchor_lms = mul(renodx::tonemap::psychov::PSYCHO35_BT709_TO_LMS_MAT, float3(MID_GRAY, MID_GRAY, MID_GRAY));
+
+  // PsychoV-35 conditioning requires finite input, positive physiological Yf, and positive unweighted LMS cone mean.
+  if (input_finite
+      && (renodx::color::yf::from::LMS(input_lms) > 0.f)
+      && (renodx::tonemap::psychov::psycho35_Mean(input_lms / anchor_lms) > 0.f)) {
+    float peak_value = max(1.f, RENODX_PEAK_WHITE_NITS / RENODX_DIFFUSE_WHITE_NITS);
+    if (RENODX_GAMMA_CORRECTION == renodx::draw::GAMMA_CORRECTION_GAMMA_2_2) {
+      peak_value = renodx::color::correct::Gamma(peak_value, true, 2.2f);
+    } else if (RENODX_GAMMA_CORRECTION == renodx::draw::GAMMA_CORRECTION_GAMMA_2_4) {
+      peak_value = renodx::color::correct::Gamma(peak_value, true, 2.4f);
+    }
+
+    tonemapped = renodx::tonemap::psychov::psychotm_test35(
+        untonemapped_color,
+        peak_value,
+        RENODX_TONE_MAP_EXPOSURE,
+        RENODX_TONE_MAP_HIGHLIGHTS,
+        RENODX_TONE_MAP_SHADOWS,
+        RENODX_TONE_MAP_CONTRAST,
+        RENODX_TONE_MAP_SATURATION,
+        0.f,
+        100.f,
+        1.f,
+        1.f,
+        1,
+        vanilla_cone * (max(0.01f, RENODX_PSYCHOV_CONE_RESPONSE)),
+        float3(MID_GRAY, MID_GRAY, MID_GRAY),
+        float3(anchor_out, anchor_out, anchor_out),
+        saturate(RENODX_PSYCHOV_GAMUT_COMPRESSION),
+        (int)RENODX_PSYCHOV_GAMUT_MODE,
+        1.f,
+        clamp(RENODX_PSYCHOV_COMPRESSION, 0.f, 2.f),
+        (int)RENODX_PSYCHOV_SOURCE_BOUNDARY,
+        true);  // human_gamut_conditioning: the LUT grade delta can push cones negative, test35 conditions and floors them
+
+    if (any((asuint(tonemapped) & 0x7f800000u) == 0x7f800000u)) {
+      tonemapped = 0.f.xxx;
+    }
+
+    // psychotm_test35 has no blowout input (that slot is a placeholder), so apply it as the dechroma
+    tonemapped = renodx::color::grade::UserColorGrading(tonemapped, 1.f, 1.f, 1.f, 1.f, 1.f, RENODX_TONE_MAP_BLOWOUT, 0.f);
+  }
+
+  return renodx::draw::RenderIntermediatePass(tonemapped);
+}
+
 // untonemapped: linear scene color after exposure and bloom, input of the vanilla grading LUT.
 // graded_sdr_encoded: vanilla LUT result as written by the game (tonemap + grade, sRGB encoded, scaled).
 // lut / lut_sampler / lut_params (cb0[62].zw: scale, bias): the vanilla LUT.
@@ -43,46 +95,8 @@ float3 ToneMapLut(float3 untonemapped, float3 graded_sdr_encoded, Texture3D<floa
                       / (MID_GRAY * 0.2f);
   const float vanilla_cone = max(0.01f, MID_GRAY * slope / max(vanilla_mid_gray_out, 1e-5f));
 
-  float peak_value = max(1.f, RENODX_PEAK_WHITE_NITS / RENODX_DIFFUSE_WHITE_NITS);
-  if (RENODX_GAMMA_CORRECTION == renodx::draw::GAMMA_CORRECTION_GAMMA_2_2) {
-    peak_value = renodx::color::correct::Gamma(peak_value, true, 2.2f);
-  } else if (RENODX_GAMMA_CORRECTION == renodx::draw::GAMMA_CORRECTION_GAMMA_2_4) {
-    peak_value = renodx::color::correct::Gamma(peak_value, true, 2.4f);
-  }
-
   const float3 graded_untonemapped = renodx::draw::ComputeUntonemappedGraded(untonemapped, graded_sdr, neutral_sdr);
-
-  // PsychoV-35 conditioning needs a positive mean cone signal; black has nothing to tonemap.
-  if (!(renodx::color::yf::from::LMS(mul(renodx::tonemap::psychov::PSYCHO35_BT709_TO_LMS_MAT, graded_untonemapped)) > 0.f)) {
-    return renodx::draw::RenderIntermediatePass(0.f.xxx);
-  }
-
-  float3 tonemapped = renodx::tonemap::psychov::psychotm_test35(
-      graded_untonemapped,
-      peak_value,
-      RENODX_TONE_MAP_EXPOSURE,
-      RENODX_TONE_MAP_HIGHLIGHTS,
-      RENODX_TONE_MAP_SHADOWS,
-      RENODX_TONE_MAP_CONTRAST,
-      RENODX_TONE_MAP_SATURATION,
-      0.f,
-      100.f,
-      1.f,
-      1.f,
-      1,
-      vanilla_cone * (max(0.01f, RENODX_PSYCHOV_CONE_RESPONSE)),
-      float3(MID_GRAY, MID_GRAY, MID_GRAY),
-      float3(vanilla_mid_gray_out, vanilla_mid_gray_out, vanilla_mid_gray_out),
-      saturate(RENODX_PSYCHOV_GAMUT_COMPRESSION),
-      (int)RENODX_PSYCHOV_GAMUT_MODE,
-      1.f,
-      clamp(RENODX_PSYCHOV_COMPRESSION, 0.f, 2.f),
-      (int)RENODX_PSYCHOV_SOURCE_BOUNDARY,
-      true);  // human_gamut_conditioning: the LUT grade delta can push cones negative, test35 conditions and floors them
-
-  // psychotm_test35 has no blowout input (that slot is a placeholder), so apply it as the dechroma
-  tonemapped = renodx::color::grade::UserColorGrading(tonemapped, 1.f, 1.f, 1.f, 1.f, 1.f, RENODX_TONE_MAP_BLOWOUT, 0.f);
-  return renodx::draw::RenderIntermediatePass(tonemapped);
+  return ApplyPsychoV35(graded_untonemapped, vanilla_mid_gray_out, vanilla_cone);
 }
 
 #endif  // SRC_GAMES_RVTHEREYET_COMMON_HLSLI_
