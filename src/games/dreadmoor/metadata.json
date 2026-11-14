@@ -1,0 +1,1 @@
+{"$schema":"https://cdn.jsdelivr.net/gh/clshortfuse/renodx/renodx-metadata-schema.json","id":"dreadmoor","title":"Dreadmoor","status":"experimental","deploy":{"game_exe":"Dreadmoor-Win64-Shipping.exe","api":"d3d12","architecture":"x64"}}
