@@ -1,0 +1,1 @@
+{"$schema":"https://cdn.jsdelivr.net/gh/clshortfuse/renodx/renodx-metadata-schema.json","id":"subnautica2","title":"Subnautica 2","status":"experimental","deploy":{"game_exe":"Subnautica2-WinGDK-Shipping.exe","api":"d3d12","architecture":"x64"}}
