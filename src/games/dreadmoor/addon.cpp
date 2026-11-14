@@ -23,7 +23,9 @@ namespace {
 
 renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntry(0x35C29302),
+    CustomShaderEntry(0xD78576EE),
     CustomShaderEntry(0x66864DE3),
+    CustomShaderEntry(0x4CD3DFB9),
 };
 
 ShaderInjectData shader_injection;
