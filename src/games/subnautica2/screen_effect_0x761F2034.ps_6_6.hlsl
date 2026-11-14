@@ -38,11 +38,6 @@ cbuffer cb3 : register(b3) {
 
 static const float BLUR_OFFSETS[4] = {-0.2199999988079071f, -0.07999999821186066f, 0.07999999821186066f, 0.2199999988079071f};
 
-// The vanilla shader returns 0 instead of pow(0, power)
-float PowZero(float value, float power) {
-  return (value <= 2.980232949312267e-08f) ? 0.f : pow(value, power);
-}
-
 float3 SampleSceneClamped(float2 uv) {
   return t6.Sample(s6, clamp(cb0[0].zw * uv + cb0[0].xy, cb0[1].xy, cb0[1].zw)).rgb;
 }
@@ -166,7 +161,12 @@ float4 main(noperspective float4 position : SV_Position, linear float4 texcoord 
   const float grain_falloff = saturate(1.2000000476837158f - saturate(frost_edge_distance * 0.8999999761581421f));
   if (cb2[1].w > 0.f) {
     const float3 grain_offset = float3(0.07829385250806808f, 0.11805565655231476f, 0.07919912785291672f);
-    color = ((saturate(((((grain * (color_luma - color)) + color) * 2.5f) + grain_offset) * grain_falloff) - color) * cb2[1].w) + color;
+    float3 grain_color = ((((grain * (color_luma - color)) + color) * 2.5f) + grain_offset) * grain_falloff;
+    // RenoDX: this clip is the only one that limits the result to the SDR range, so only vanilla keeps it
+    if (RENODX_TONE_MAP_TYPE == 0.f) {
+      grain_color = saturate(grain_color);
+    }
+    color = ((grain_color - color) * cb2[1].w) + color;
   }
 
   // Radial pattern overlay

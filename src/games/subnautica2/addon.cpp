@@ -25,6 +25,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntry(0xD3AB43C5),
     CustomShaderEntry(0xEC4F5B31),
     CustomShaderEntry(0x761F2034),
+    CustomShaderEntry(0xEF77ACDB),
 };
 
 ShaderInjectData shader_injection;

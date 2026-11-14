@@ -5,6 +5,11 @@
 
 static const float MID_GRAY = 0.18f;
 
+// The vanilla screen effects return 0 instead of pow(0, power)
+float PowZero(float value, float power) {
+  return (value <= 2.980232949312267e-08f) ? 0.f : pow(value, power);
+}
+
 // Vanilla log encoding of the scene color that indexes the grading LUT
 static const float LUT_LOG_OFFSET = 0.002667719265f;
 static const float LUT_LOG_SCALE = 0.0714285746f;
