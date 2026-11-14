@@ -117,6 +117,9 @@ inline constexpr std::wstring_view DEVKIT_MCP_PIPE_PREFIX = L"renodx-devkit-mcp"
 std::atomic<reshade::api::device*> snapshot_device = nullptr;
 std::atomic<reshade::api::device*> snapshot_queued_device = nullptr;
 std::atomic<uint32_t> snapshot_submission_counter = 0u;
+constexpr size_t MIN_SNAPSHOT_DRAW_COUNT = 64u;
+constexpr uint32_t MAX_SNAPSHOT_RETRIES = 8u;
+uint32_t snapshot_retry_count = 0u;
 auto devkit_mcp_session = devkit_mcp_server_session::Create(DEVKIT_MCP_PIPE_PREFIX);
 std::atomic<uint32_t> devkit_primary_device_api = 0u;
 
@@ -9249,23 +9252,40 @@ void OnPresent(
     renodx::utils::shader::dump::DumpAllPending();
   }
 
+  // The caller must hold device_data->mutex
+  const auto reset_snapshot_capture = [](DeviceData* device_data) {
+    device_data->draw_details_list.clear();
+    device_data->draw_detail_indexes_by_cmd_list.clear();
+    device_data->resource_usage_by_handle.clear();
+    device_data->snapshot_rows.clear();
+    device_data->snapshot_row_layout_key = 0u;
+    ++device_data->snapshot_rows_generation;
+    device_data->snapshot_rows_valid = false;
+    snapshot_submission_counter.store(0u, std::memory_order_relaxed);
+  };
+
   reshade::api::device* active_snapshot_device = snapshot_device;
   if (active_snapshot_device == nullptr) {
     if (snapshot_queued_device == device) {
       auto* device_data = get_data();
       std::unique_lock lock(device_data->mutex);
-      device_data->draw_details_list.clear();
-      device_data->draw_detail_indexes_by_cmd_list.clear();
-      device_data->resource_usage_by_handle.clear();
-      device_data->snapshot_rows.clear();
-      device_data->snapshot_row_layout_key = 0u;
-      ++device_data->snapshot_rows_generation;
-      device_data->snapshot_rows_valid = false;
-      snapshot_submission_counter.store(0u, std::memory_order_relaxed);
+      reset_snapshot_capture(device_data);
       snapshot_device = device;
       snapshot_queued_device = nullptr;
     }
   } else if (device == active_snapshot_device) {
+    {
+      // With frame generation, presents alternate between rendered and generated frames. A window that starts on the
+      // wrong present holds no rendering, so capture the next window instead of keeping it
+      auto* device_data = get_data();
+      std::unique_lock lock(device_data->mutex);
+      if (device_data->draw_details_list.size() < MIN_SNAPSHOT_DRAW_COUNT && snapshot_retry_count < MAX_SNAPSHOT_RETRIES) {
+        ++snapshot_retry_count;
+        reset_snapshot_capture(device_data);
+        return;
+      }
+      snapshot_retry_count = 0u;
+    }
     snapshot_device = nullptr;
     auto* device_data = get_data();
     std::unique_lock lock(device_data->mutex);
