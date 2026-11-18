@@ -1,44 +1,5 @@
 #include "../shared.h"
 
-float3 ApplyPerChannelCorrectionICtCp(
-    float3 untonemapped, float3 per_channel_color,
-    float hue_correct_strength = 0.f,
-    float chrominance_loss_restore_strength = 0.f,
-    float chrominance_gain_reduce_strength = 0.f,
-    float saturation = 1.f) {
-  if (hue_correct_strength != 0.f
-      || chrominance_loss_restore_strength != 0.f
-      || chrominance_gain_reduce_strength != 0.f
-      || saturation != 1.f) {
-    float3 perceptual_new = renodx::color::ictcp::from::BT709(per_channel_color);
-    const float3 untonemapped_ictcp = renodx::color::ictcp::from::BT709(untonemapped);
-
-    float chrominance_current = length(perceptual_new.yz);
-
-    if (hue_correct_strength != 0.f) {
-      const float chrominance_pre = chrominance_current;
-      perceptual_new.yz = lerp(perceptual_new.yz, untonemapped_ictcp.yz, hue_correct_strength);
-      const float chrominance_post = length(perceptual_new.yz);
-      perceptual_new.yz *= renodx::math::SafeDivision(chrominance_pre, chrominance_post, 1.f);
-      chrominance_current = chrominance_pre;
-    }
-
-    const float untonemapped_chrominance = length(untonemapped_ictcp.yz);
-    const float target_chrominance_ratio = renodx::math::SafeDivision(untonemapped_chrominance, chrominance_current, 1.f);
-    const float chroma_gain_mask = step(untonemapped_chrominance, chrominance_current);  // 1 when current chroma is above reference
-    const float chroma_loss_mask = 1.f - chroma_gain_mask;                               // 1 when current chroma is below reference
-    const float chrominance_correct_strength = (chroma_gain_mask * chrominance_gain_reduce_strength)
-                                               + (chroma_loss_mask * chrominance_loss_restore_strength);
-    float chroma_scale = lerp(1.f, target_chrominance_ratio, chrominance_correct_strength);
-
-    perceptual_new.yz *= chroma_scale;
-    perceptual_new.yz *= saturation;
-
-    per_channel_color = renodx::color::bt709::from::ICtCp(perceptual_new);
-  }
-  return per_channel_color;
-}
-
 renodx::canvas::Context CreateGTAVDebugOverlayContext(
     float3 color,
     float2 screen_position,
@@ -297,108 +258,104 @@ float3 ApplyAnchoredAdaptationContrast(float3 color, float contrast,
 float4 GenerateGTAVOutput(float3 input_color, float2 position, float2 screen_position, GTAVTonemapConfig config) {
   float3 untonemapped = input_color;
 
-  float3 tonemapped;
-  if (RENODX_TONE_MAP_TYPE == 6.f) {
-    // abs() needed for transitions
-    config.a = abs(config.a);
-    config.b = abs(config.b);
-    config.c_times_b = abs(config.c_times_b);
-    config.d_times_e = abs(config.d_times_e);
-    config.d_times_f = abs(config.d_times_f);
-    config.e_over_f = abs(config.e_over_f);
+  // abs() needed for transitions
+  config.a = abs(config.a);
+  config.b = abs(config.b);
+  config.c_times_b = abs(config.c_times_b);
+  config.d_times_e = abs(config.d_times_e);
+  config.d_times_f = abs(config.d_times_f);
+  config.e_over_f = abs(config.e_over_f);
 
 #if 1  // inflection
-    const float mid_gray_in = FindGTAVHableInflection(config.a,
-                                                      config.b,
-                                                      config.c_times_b,
-                                                      config.d_times_e,
-                                                      config.d_times_f);
-    const float mid_gray_out = ApplyGTAVHableTonemap(mid_gray_in,
-                                                     config.a,
-                                                     config.b,
-                                                     config.c_times_b,
-                                                     config.d_times_e,
-                                                     config.d_times_f,
-                                                     config.e_over_f,
-                                                     config.white_scale);
+  const float mid_gray_in = FindGTAVHableInflection(config.a,
+                                                    config.b,
+                                                    config.c_times_b,
+                                                    config.d_times_e,
+                                                    config.d_times_f);
+  const float mid_gray_out = ApplyGTAVHableTonemap(mid_gray_in,
+                                                   config.a,
+                                                   config.b,
+                                                   config.c_times_b,
+                                                   config.d_times_e,
+                                                   config.d_times_f,
+                                                   config.e_over_f,
+                                                   config.white_scale);
 #else  // 0.18 out
-    const float mid_gray_out = 0.18f;
-    const float mid_gray_in = ApplyGTAVHableTonemapInverse(mid_gray_out,
-                                                           config.a,
-                                                           config.b,
-                                                           config.c_times_b,
-                                                           config.d_times_e,
-                                                           config.d_times_f,
-                                                           config.e_over_f,
-                                                           config.white_scale);
+  const float mid_gray_out = 0.18f;
+  const float mid_gray_in = ApplyGTAVHableTonemapInverse(mid_gray_out,
+                                                         config.a,
+                                                         config.b,
+                                                         config.c_times_b,
+                                                         config.d_times_e,
+                                                         config.d_times_f,
+                                                         config.e_over_f,
+                                                         config.white_scale);
 #endif
 
-    const float hable_slope = CalculateGTAVHableDerivative(mid_gray_in,
-                                                           config.a,
-                                                           config.b,
-                                                           config.c_times_b,
-                                                           config.d_times_e,
-                                                           config.d_times_f,
-                                                           config.white_scale);
+  const float hable_slope = CalculateGTAVHableDerivative(mid_gray_in,
+                                                         config.a,
+                                                         config.b,
+                                                         config.c_times_b,
+                                                         config.d_times_e,
+                                                         config.d_times_f,
+                                                         config.white_scale);
 
-    float peak_value = RENODX_PEAK_WHITE_NITS / RENODX_DIFFUSE_WHITE_NITS;
-    if (RENODX_GAMMA_CORRECTION == 1.f) peak_value = renodx::color::correct::GammaSafe(peak_value, true, 2.2f);
-    if (RENODX_GAMMA_CORRECTION == 2.f) peak_value = renodx::color::correct::GammaSafe(peak_value, true, 2.4f);
+  float peak_value = RENODX_PEAK_WHITE_NITS / RENODX_DIFFUSE_WHITE_NITS;
+  if (RENODX_GAMMA_CORRECTION == 1.f) peak_value = renodx::color::correct::GammaSafe(peak_value, true, 2.2f);
+  if (RENODX_GAMMA_CORRECTION == 2.f) peak_value = renodx::color::correct::GammaSafe(peak_value, true, 2.4f);
+  peak_value = max(1.f, peak_value);
 
-    tonemapped = renodx::tonemap::psychov::psychotm_test22(
-        untonemapped, peak_value,
-        RENODX_TONE_MAP_EXPOSURE, RENODX_TONE_MAP_HIGHLIGHTS, RENODX_TONE_MAP_SHADOWS, RENODX_TONE_MAP_CONTRAST,
-        RENODX_TONE_MAP_SATURATION, 1.f, RENODX_RENO_DRT_WHITE_CLIP, 1.f, 1.f, 0,
-        hable_slope * mid_gray_in / mid_gray_out, mid_gray_in, mid_gray_out, 1.f, 1, 1.f, 0.f);
+  float3 tonemapped = 0.f.xxx;
 
-    float maxch_scale = renodx::tonemap::neutwo::ComputeBT709Scale(tonemapped, 1.f, peak_value);
-    float3 post_process_color = ApplyPostToneMapGrading(tonemapped * maxch_scale, config) / maxch_scale;
+  const bool input_finite = all((asuint(untonemapped) & 0x7f800000u) != 0x7f800000u);
+  const float3 input_lms = mul(renodx::tonemap::psychov::PSYCHO35_BT709_TO_LMS_MAT, untonemapped);
+  const float3 anchor_lms = mul(renodx::tonemap::psychov::PSYCHO35_BT709_TO_LMS_MAT, mid_gray_in.xxx);
 
-    tonemapped = post_process_color;
+  // PsychoV-35 conditioning requires finite input, positive physiological Yf, and positive unweighted LMS cone mean.
+  if (input_finite
+      && mid_gray_in > 0.f
+      && mid_gray_out > 0.f
+      && (renodx::color::yf::from::LMS(input_lms) > 0.f)
+      && (renodx::tonemap::psychov::psycho35_Mean(input_lms / anchor_lms) > 0.f)) {
+    const float cone_response = max(0.01f, (hable_slope * mid_gray_in / mid_gray_out) * max(0.01f, RENODX_PSYCHOV_CONE_RESPONSE));
+    tonemapped = renodx::tonemap::psychov::psychotm_test35(
+        untonemapped,
+        peak_value,
+        RENODX_TONE_MAP_EXPOSURE,
+        RENODX_TONE_MAP_HIGHLIGHTS,
+        RENODX_TONE_MAP_SHADOWS,
+        RENODX_TONE_MAP_CONTRAST,
+        RENODX_TONE_MAP_SATURATION,
+        1.f,
+        100.f,
+        1.f,
+        1.f,
+        0,
+        cone_response,
+        mid_gray_in,
+        mid_gray_out,
+        1.f,
+        (int)RENODX_PSYCHOV_GAMUT_MODE,
+        1.f,
+        0.f,
+        renodx::tonemap::psychov::PSYCHO35_SOURCE_BOUNDARY_BT709,
+        true);
 
-    // tonemapped = DrawGTAVHableParamsDebug(tonemapped, screen_position, config, mid_gray_in, mid_gray_out, hable_slope);
-
-  } else {
-    const float mid_gray_in = FindGTAVHableInflection(config.a,
-                                                      config.b,
-                                                      config.c_times_b,
-                                                      config.d_times_e,
-                                                      config.d_times_f);
-    const float mid_gray_out = ApplyGTAVHableTonemap(mid_gray_in,
-                                                     config.a,
-                                                     config.b,
-                                                     config.c_times_b,
-                                                     config.d_times_e,
-                                                     config.d_times_f,
-                                                     config.e_over_f,
-                                                     config.white_scale);
-
-    float3 vanilla_color = ApplyGTAVHableTonemap(untonemapped,
-                                                 config.a,
-                                                 config.b,
-                                                 config.c_times_b,
-                                                 config.d_times_e,
-                                                 config.d_times_f,
-                                                 config.e_over_f,
-                                                 config.white_scale);
-
-    untonemapped = untonemapped * mid_gray_out / mid_gray_in;
-
-    if (RENODX_TONE_MAP_TYPE != 0.f
-        && (CUSTOM_COLOR_GRADE_BLOWOUT_RESTORATION != 0.f
-            || CUSTOM_COLOR_GRADE_HUE_CORRECTION != 0.f
-            || CUSTOM_COLOR_GRADE_SATURATION_CORRECTION != 0.f)) {
-      vanilla_color = ApplyPerChannelCorrectionICtCp(untonemapped,
-                                                     vanilla_color,
-                                                     CUSTOM_COLOR_GRADE_HUE_CORRECTION,
-                                                     CUSTOM_COLOR_GRADE_BLOWOUT_RESTORATION,
-                                                     CUSTOM_COLOR_GRADE_SATURATION_CORRECTION);
+    if (any((asuint(tonemapped) & 0x7f800000u) == 0x7f800000u)) {
+      tonemapped = 0.f.xxx;
     }
 
-    float3 post_process_color = ApplyPostToneMapGrading(vanilla_color, config);
-
-    tonemapped = renodx::draw::ToneMapPass(untonemapped, post_process_color);
+    tonemapped = renodx::color::grade::UserColorGrading(
+        tonemapped, 1.f, 1.f, 1.f, 1.f, 1.f, RENODX_TONE_MAP_BLOWOUT, 0.f);
   }
+
+  if (RENODX_COLOR_GRADE_STRENGTH != 0.f) {
+    float maxch_scale = renodx::tonemap::neutwo::ComputeBT709Scale(tonemapped, 1.f, peak_value);
+    float3 post_process_color = ApplyPostToneMapGrading(tonemapped * maxch_scale, config) / maxch_scale;
+    tonemapped = lerp(tonemapped, post_process_color, RENODX_COLOR_GRADE_STRENGTH);
+  }
+
+  // tonemapped = DrawGTAVHableParamsDebug(tonemapped, screen_position, config, mid_gray_in, mid_gray_out, hable_slope);
 
   if (CUSTOM_FILM_GRAIN != 0.f) {
     tonemapped = renodx::effects::ApplyFilmGrain(tonemapped, position, CUSTOM_RANDOM, CUSTOM_FILM_GRAIN * 0.03f, 1.f);
