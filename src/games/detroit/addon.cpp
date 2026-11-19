@@ -152,7 +152,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
         .key = "ColorGradeGamutExpansion",
         .binding = &shader_injection.custom_gamut_expansion,
-        .default_value = 0.f,
+        .default_value = 20.f,
         .label = "Gamut Expansion",
         .section = "Color Grading",
         .tooltip = "Expands saturated colors toward BT.2020. 0 keeps the game's BT.709 colors.",
