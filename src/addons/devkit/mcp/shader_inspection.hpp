@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <format>
@@ -42,30 +43,81 @@ struct TextSectionSummary {
   std::optional<std::string> text = std::nullopt;
   std::optional<std::size_t> full_length = std::nullopt;
   std::optional<std::size_t> returned_length = std::nullopt;
+  std::optional<std::size_t> total_lines = std::nullopt;
+  std::optional<std::size_t> start_line = std::nullopt;
+  std::optional<std::size_t> returned_lines = std::nullopt;
   bool truncated = false;
   std::optional<std::string> error = std::nullopt;
 
   TextSectionSummary() = default;
 
-  TextSectionSummary(const TextSection& section, const std::optional<std::size_t>& max_text_length)
+  TextSectionSummary(
+      const TextSection& section,
+      const std::optional<std::size_t>& max_text_length,
+      const std::optional<std::size_t>& requested_start_line = std::nullopt,
+      const std::optional<std::size_t>& requested_line_count = std::nullopt)
       : available(section.available),
         error(section.error) {
     if (!section.available) {
       return;
     }
 
-    auto returned_text_value = section.text;
-    const auto full_length_value = returned_text_value.size();
+    const auto full_length_value = section.text.size();
+    std::vector<std::string_view> lines;
+    std::size_t pos = 0u;
+    while (pos < section.text.size()) {
+      const auto newline_pos = section.text.find('\n', pos);
+      if (newline_pos == std::string::npos) {
+        lines.emplace_back(section.text.data() + pos, section.text.size() - pos);
+        break;
+      }
+      lines.emplace_back(section.text.data() + pos, newline_pos - pos);
+      pos = newline_pos + 1u;
+    }
+
+    const auto total_line_count = lines.size();
     bool truncated_value = false;
+    std::string returned_text_value;
+    std::size_t effective_start_line = 1u;
+    std::size_t effective_returned_lines = total_line_count;
+
+    if (requested_start_line.has_value() || requested_line_count.has_value()) {
+      effective_start_line = requested_start_line.value_or(1u);
+      const auto zero_based_start = (effective_start_line > 0u) ? (effective_start_line - 1u) : 0u;
+      if (zero_based_start < total_line_count) {
+        const auto remaining = total_line_count - zero_based_start;
+        effective_returned_lines = requested_line_count.has_value()
+                                       ? std::min<std::size_t>(requested_line_count.value(), remaining)
+                                       : remaining;
+        if (zero_based_start > 0u || (zero_based_start + effective_returned_lines) < total_line_count) {
+          truncated_value = true;
+        }
+        for (std::size_t idx = 0u; idx < effective_returned_lines; ++idx) {
+          if (idx > 0u) {
+            returned_text_value.push_back('\n');
+          }
+          returned_text_value.append(lines[zero_based_start + idx]);
+        }
+      } else {
+        effective_returned_lines = 0u;
+        truncated_value = total_line_count > 0u;
+      }
+      start_line = effective_start_line;
+      returned_lines = effective_returned_lines;
+    } else {
+      returned_text_value = section.text;
+    }
+
     if (max_text_length.has_value() && returned_text_value.size() > max_text_length.value()) {
       returned_text_value.resize(max_text_length.value());
       truncated_value = true;
     }
 
-    text = returned_text_value;
     full_length = full_length_value;
-    returned_length = truncated_value ? max_text_length.value() : full_length_value;
+    returned_length = returned_text_value.size();
+    total_lines = total_line_count;
     truncated = truncated_value;
+    text = std::move(returned_text_value);
   }
 };
 
@@ -81,6 +133,13 @@ inline void to_json(json& j, const TextSectionSummary& value) {
     j["text"] = value.text.value();
     j["fullLength"] = value.full_length.value();
     j["returnedLength"] = value.returned_length.value();
+    j["totalLines"] = value.total_lines.value_or(0u);
+    if (value.start_line.has_value()) {
+      j["startLine"] = value.start_line.value();
+    }
+    if (value.returned_lines.has_value()) {
+      j["returnedLines"] = value.returned_lines.value();
+    }
     j["truncated"] = value.truncated;
   }
 }
@@ -91,6 +150,7 @@ struct ToolContext {
       get_shader_summary;
   std::function<TextSection(std::uint32_t device_index, std::uint32_t shader_hash)> get_disassembly;
   std::function<TextSection(std::uint32_t device_index, std::uint32_t shader_hash)> get_decompilation;
+  std::function<json(std::uint32_t device_index, std::uint32_t shader_hash)> get_snapshot_context;
 };
 
 namespace internal {
@@ -199,11 +259,20 @@ namespace internal {
   }
 
   const auto& value = arguments[std::string(key)];
-  if (!value.is_number_unsigned()) {
+  if (!value.is_number_unsigned() && !value.is_number_integer()) {
     throw std::runtime_error(std::format("{} must be a positive integer.", key));
   }
 
-  const auto parsed_value = value.get<std::uint64_t>();
+  std::uint64_t parsed_value = 0u;
+  if (value.is_number_unsigned()) {
+    parsed_value = value.get<std::uint64_t>();
+  } else {
+    const auto signed_value = value.get<std::int64_t>();
+    if (signed_value <= 0) {
+      throw std::runtime_error(std::format("{} must be greater than zero.", key));
+    }
+    parsed_value = static_cast<std::uint64_t>(signed_value);
+  }
   if (parsed_value == 0u) {
     throw std::runtime_error(std::format("{} must be greater than zero.", key));
   }
@@ -243,6 +312,15 @@ inline ToolResult HandleGetShaderTool(const json& arguments, const ToolContext& 
   const auto shader_hash = shader_hash::GetRequired(arguments, "shaderHash");
   const auto view_mode = internal::GetRequestedViewMode(arguments);
   const auto max_text_length = internal::GetOptionalMaxTextLength(arguments, "maxTextLength");
+  const auto start_line = internal::GetOptionalMaxTextLength(arguments, "startLine");
+  const auto line_count = internal::GetOptionalMaxTextLength(arguments, "lineCount");
+  bool include_snapshot_context = false;
+  if (arguments.contains("includeSnapshotContext")) {
+    if (!arguments["includeSnapshotContext"].is_boolean()) {
+      throw std::runtime_error("includeSnapshotContext must be a boolean.");
+    }
+    include_snapshot_context = arguments["includeSnapshotContext"].get<bool>();
+  }
   auto shader_summary = context.get_shader_summary(device_index, shader_hash);
 
   json result = {
@@ -251,6 +329,9 @@ inline ToolResult HandleGetShaderTool(const json& arguments, const ToolContext& 
       {"views", internal::GetViewSectionNames(view_mode)},
       {"shader", shader_summary},
   };
+  if (include_snapshot_context && context.get_snapshot_context) {
+    result["snapshotContext"] = context.get_snapshot_context(device_index, shader_hash);
+  }
 
   json sections = json::object();
   std::vector<std::string_view> section_names;
@@ -263,7 +344,9 @@ inline ToolResult HandleGetShaderTool(const json& arguments, const ToolContext& 
               .available = false,
               .error = std::format("{} is not available in this MCP session.", key),
           },
-          max_text_length);
+          max_text_length,
+          start_line,
+          line_count);
       unavailable_sections += 1u;
       section_names.push_back(key);
       return;
@@ -273,7 +356,7 @@ inline ToolResult HandleGetShaderTool(const json& arguments, const ToolContext& 
     if (!section.available) {
       unavailable_sections += 1u;
     }
-    sections[std::string(key)] = TextSectionSummary(section, max_text_length);
+    sections[std::string(key)] = TextSectionSummary(section, max_text_length, start_line, line_count);
     section_names.push_back(key);
   };
 

@@ -26,7 +26,7 @@ flowchart LR
     Protocol["utils/mcp/protocol.hpp<br/>protocol helpers"]
     Server["utils/mcp/server.hpp<br/>generic MCP Server"]
     Catalog["tool_catalog.hpp<br/>typed metadata"]
-    Handlers["tool headers<br/>snapshot_tools / output_chain / deep_analysis / shader_inspection / live_shaders / resource_analysis / resource_clone / texture_replace"]
+    Handlers["tool headers<br/>snapshot_tools / output_chain / upgrade_candidates / device_proxy / deep_analysis / shader_inspection / live_shaders / resource_analysis / resource_clone / texture_replace"]
     Context["ToolContext callbacks"]
     Addon["addons/devkit/addon.cpp"]
     Runtime["tracked devices / shaders / resources / snapshots"]
@@ -77,8 +77,10 @@ This keeps tool definitions readable without building large raw JSON blobs by ha
 | [`resource_handle.hpp`](/C:/Mods/renodx/src/addons/devkit/mcp/resource_handle.hpp) | Resource-handle parsing for resource-clone and resource-analysis tools. |
 | [`snapshot_tools.hpp`](/C:/Mods/renodx/src/addons/devkit/mcp/snapshot_tools.hpp) | Snapshot, status/tracking, swapchain info, resource listing, shader bypass, draw listing, and device selection handlers. |
 | [`output_chain.hpp`](/C:/Mods/renodx/src/addons/devkit/mcp/output_chain.hpp) | Backwards backbuffer-to-upstream post-processing graph tracer, UI boundary detector, pass classifier (`devkit_classify_postprocess`), and format bottleneck reporter (`devkit_trace_output_chain`). |
+| [`upgrade_candidates.hpp`](/C:/Mods/renodx/src/addons/devkit/mcp/upgrade_candidates.hpp) | Resource-upgrade assistant (`devkit_check_upgrade_candidates`) analyzing bottleneck targets, copy/MSAA/view-aliasing/cloning risks, tracked-resource blast radius, and generating `ResourceUpgradeInfo` C++ snippets. |
+| [`device_proxy.hpp`](/C:/Mods/renodx/src/addons/devkit/mcp/device_proxy.hpp) | SwapChain Device Proxy inspection and Present-thread configuration handlers (`devkit_get_device_proxy_state`, `devkit_set_device_proxy_mode`). |
 | [`deep_analysis.hpp`](/C:/Mods/renodx/src/addons/devkit/mcp/deep_analysis.hpp) | Draw constant buffer & push-constant readback/diff (`devkit_get_draw_constants`, `devkit_diff_draw_constants`), snapshot profile save/list/compare (`devkit_compare_snapshots`), and in-memory 1-frame API trace capture/log (`devkit_queue_trace`, `devkit_get_trace_log`). |
-| [`shader_inspection.hpp`](/C:/Mods/renodx/src/addons/devkit/mcp/shader_inspection.hpp) | Shader summary/disassembly/decompilation tool handlers. |
+| [`shader_inspection.hpp`](/C:/Mods/renodx/src/addons/devkit/mcp/shader_inspection.hpp) | Shader summary/disassembly/decompilation tool handlers (with line-range paging and optional `includeSnapshotContext` binding table). |
 | [`live_shaders.hpp`](/C:/Mods/renodx/src/addons/devkit/mcp/live_shaders.hpp) | Dump/load/unload live shader and live compilation/draw-count status (`devkit_get_live_shader_status`) tool handlers. |
 | [`resource_analysis.hpp`](/C:/Mods/renodx/src/addons/devkit/mcp/resource_analysis.hpp) | 2D/3D resource readback (with p99/p99.9 percentiles and gamut breakdown), 3D/strip LUT analysis (`devkit_analyze_lut`), single-frame batch pass scanner (`devkit_scan_pass_resources`), 2-frame live-vs-vanilla A/B readback (`devkit_compare_resource_ab`), preview, EXR/PNG dump, and hash-named dump handlers. |
 | [`resource_clone.hpp`](/C:/Mods/renodx/src/addons/devkit/mcp/resource_clone.hpp) | Clone hotswap toggle tool handler. |
@@ -214,6 +216,8 @@ Response additions:
 - `devkit_get_live_shader_status` reports live shader directory, active runtime replacement count, per-file compilation status & exact error message, and `snapshotDrawCount`.
 - `devkit_compare_resource_ab` runs an automated 2-frame A/B readback (with live shader replacements vs. temporarily suspended vanilla) and returns luminance, p99/p99.9, HDR/WCG, NaN, and gamut deltas.
 - `devkit_queue_trace` & `devkit_get_trace_log` trigger a 1-frame API trace into an in-memory buffer (plus `ReShade.log`) with optional `returnToIdle` and retrieve filtered/paged trace lines.
+- `devkit_check_upgrade_candidates` analyzes RGBA8/BGRA8/R11G11B10F/RGB10A2 targets in the output chain (or full snapshot), reports usage/MSAA/mips/array/aspect/copy-mismatch/sRGB-view/non-color-aliasing risks and tracked-resource blast radius, and outputs ready-to-paste `ResourceUpgradeInfo` C++ snippets.
+- `devkit_get_device_proxy_state` & `devkit_set_device_proxy_mode` inspect and toggle the SwapChain Device Proxy (`none`/`current_window`/`new_window`, `srgb`/`hdr10`/`scrgb`, custom FXC shaders, D3D9Ex/flip boot compatibility flags) safely on the Present thread.
 
 ## Version Metadata
 

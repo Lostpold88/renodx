@@ -341,9 +341,15 @@ inline ToolResult HandleListShadersTool(const json& arguments, const ToolContext
       (std::numeric_limits<std::uint32_t>::max)());
 
   const auto stage_filter = mcp_arguments::GetOptional<std::string>(arguments, "stage");
+  const auto bypassed_only = mcp_arguments::GetOptional<bool>(arguments, "bypassedOnly").value_or(false);
 
   const auto device_index = internal::ResolveDeviceIndex(arguments, context);
   auto shaders = context.list_shaders(device_index, stage_filter);
+  if (bypassed_only) {
+    std::erase_if(shaders, [](const shader_summary::TrackedShaderSummary& shader) {
+      return !shader.bypass_draw;
+    });
+  }
   const auto total_count = shaders.size();
   const auto clamped_offset = std::min<std::size_t>(offset, total_count);
   const auto end_index = std::min<std::size_t>(clamped_offset + limit, total_count);
@@ -364,6 +370,9 @@ inline ToolResult HandleListShadersTool(const json& arguments, const ToolContext
   };
   if (stage_filter.has_value()) {
     result["stage"] = stage_filter.value();
+  }
+  if (bypassed_only) {
+    result["bypassedOnly"] = true;
   }
 
   auto text = std::format(

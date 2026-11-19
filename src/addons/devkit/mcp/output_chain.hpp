@@ -215,7 +215,7 @@ struct ToolContext {
     }
     if (writes_bb) {
       backbuffer_writer_indices.push_back(draw.draw_index);
-      const bool is_copy_method = (draw.method == "CopyResource" || draw.method == "CopyTextureRegion");
+      const bool is_copy_method = (draw.method == "Copy" || draw.method == "CopyResource" || draw.method == "CopyTextureRegion");
       if (is_copy_method || (draw.is_fullscreen_pass && !draw.blend_enabled)) {
         last_opaque_fullscreen_backbuffer_draw = draw.draw_index;
       }
@@ -474,7 +474,7 @@ struct ToolContext {
     std::vector<std::string> roles;
     std::vector<std::string> evidence;
 
-    const bool is_copy = (pass.method == "CopyResource" || pass.method == "CopyTextureRegion");
+    const bool is_copy = (pass.method == "Copy" || pass.method == "CopyResource" || pass.method == "CopyTextureRegion");
     if (is_copy) {
       roles.emplace_back("copy_or_resolve");
       evidence.push_back(std::format("method={}", pass.method));

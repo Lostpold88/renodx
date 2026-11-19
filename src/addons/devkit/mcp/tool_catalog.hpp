@@ -150,11 +150,12 @@ inline const renodx::utils::mcp::ToolCatalog METADATA = {
         "devkit_list_shaders",
         {
             .title = "List Shaders",
-            .description = "List tracked shaders for a device, optionally filtered by stage.",
+            .description = "List tracked shaders for a device, optionally filtered by stage or active draw bypass.",
             .input_schema = {
                 .properties = {
                     {"deviceIndex", {.types = {"integer"}, .minimum = 0}},
                     {"stage", {.types = {"string"}}},
+                    {"bypassedOnly", {.types = {"boolean"}}},
                     {"limit", {.types = {"integer"}, .minimum = 1, .maximum = 5000}},
                     {"offset", {.types = {"integer"}, .minimum = 0}},
                 },
@@ -168,7 +169,7 @@ inline const renodx::utils::mcp::ToolCatalog METADATA = {
         "devkit_get_shader",
         {
             .title = "Get Shader",
-            .description = "Return metadata for a tracked shader and optionally include disassembly or decompilation text via a named view or a views array. DXBC uses configured cmd_Decompiler.exe; DXIL uses the internal DXC decompiler.",
+            .description = "Return metadata for a tracked shader and optionally include disassembly/decompilation text (with line paging) and snapshot binding context (tN/uN/rtvN/cbN). DXBC uses configured cmd_Decompiler.exe; DXIL uses the internal DXC decompiler.",
             .input_schema = {
                 .properties = {
                     {"deviceIndex", {.types = {"integer"}, .minimum = 0}},
@@ -176,6 +177,9 @@ inline const renodx::utils::mcp::ToolCatalog METADATA = {
                     {"view", {.types = {"string"}, .enum_values = {"summary", "disassembly", "decompilation", "all"}}},
                     {"views", {.types = {"array"}, .item_types = {"string"}, .item_enum_values = {"disassembly", "decompilation"}}},
                     {"maxTextLength", {.types = {"integer"}, .minimum = 1}},
+                    {"startLine", {.types = {"integer"}, .minimum = 1}},
+                    {"lineCount", {.types = {"integer"}, .minimum = 1}},
+                    {"includeSnapshotContext", {.types = {"boolean"}}},
                 },
                 .required = {"shaderHash"},
             },
@@ -670,6 +674,58 @@ inline const renodx::utils::mcp::ToolCatalog METADATA = {
                     {"filter", {.types = {"string"}}},
                     {"limit", {.types = {"integer"}, .minimum = 1, .maximum = 5000}},
                     {"offset", {.types = {"integer"}, .minimum = 0}},
+                },
+            },
+            .annotations = {
+                .read_only_hint = true,
+            },
+        },
+    },
+    {
+        "devkit_get_device_proxy_state",
+        {
+            .title = "Get Device Proxy State",
+            .description = "Return full SwapChain Device Proxy state (mode, outputMode sRGB/HDR10/scRGB, HWND route, flip/D3D9Ex compatibility, runtime readiness, and custom FXC shader compilation status).",
+            .input_schema = {
+                .properties = {
+                    {"deviceIndex", {.types = {"integer"}, .minimum = 0}},
+                },
+            },
+            .annotations = {
+                .read_only_hint = true,
+            },
+        },
+    },
+    {
+        "devkit_set_device_proxy_mode",
+        {
+            .title = "Set Device Proxy Mode",
+            .description = "Configure SwapChain Device Proxy mode (none, current_window, new_window), output mode (srgb, hdr10, scrgb), proxyWaitIdle, custom FXC proxy shaders, and D3D9Ex/flip boot compatibility flags safely on the present thread.",
+            .input_schema = {
+                .properties = {
+                    {"deviceIndex", {.types = {"integer"}, .minimum = 0}},
+                    {"mode", {.types = {"string"}, .enum_values = {"none", "current_window", "new_window"}}},
+                    {"outputMode", {.types = {"string"}, .enum_values = {"srgb", "hdr10", "scrgb"}}},
+                    {"proxyWaitIdle", {.types = {"boolean"}}},
+                    {"useCustomShaders", {.types = {"boolean"}}},
+                    {"compileCustomShaders", {.types = {"boolean"}}},
+                    {"forceDx9Ex", {.types = {"boolean"}}},
+                    {"forceDisableFlip", {.types = {"boolean"}}},
+                },
+            },
+        },
+    },
+    {
+        "devkit_check_upgrade_candidates",
+        {
+            .title = "Check Resource Upgrade Candidates",
+            .description = "Analyze RGBA8/BGRA8/R11G11B10F/RGB10A2 targets in the post-processing chain (or full snapshot), inspect usage/MSAA/mips/array/aspect/copy-mismatch/view-aliasing risks, check blast radius against tracked resources, and generate ready-to-paste ResourceUpgradeInfo C++ snippets for addon.cpp.",
+            .input_schema = {
+                .properties = {
+                    {"deviceIndex", {.types = {"integer"}, .minimum = 0}},
+                    {"maxDepth", {.types = {"integer"}, .minimum = 1, .maximum = 256}},
+                    {"includeAllSnapshotTargets", {.types = {"boolean"}}},
+                    {"includeBackbuffers", {.types = {"boolean"}}},
                 },
             },
             .annotations = {

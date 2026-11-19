@@ -47,6 +47,8 @@ The exact MCP schema can evolve, but the current workflow is built around these 
 - `devkit_set_tracking_active` (switch hot-path hooks between Active and Idle/low-overhead mode)
 - `devkit_select_device`
 - `devkit_get_swapchain_info` (API, format, color space, HDR signaling, backbuffer handles, proxy state)
+- `devkit_get_device_proxy_state` (full SwapChain Device Proxy state: mode, outputMode sRGB/HDR10/scRGB, HWND route, flip/D3D9Ex compatibility, custom FXC shader status)
+- `devkit_set_device_proxy_mode` (configure SwapChain Device Proxy mode, outputMode sRGB/HDR10/scRGB, proxyWaitIdle, custom FXC shader compilation/toggle, and D3D9Ex/flip boot compatibility flags safely on the present thread)
 - `devkit_queue_snapshot` (supports `returnToIdle` for one-shot capture from Idle mode)
 - `devkit_snapshot_summary`
 - `devkit_compare_snapshots` (`action`: `"save"`, `"list"`, `"compare"` — diff two snapshot profiles for added/removed shaders, draw-count shifts, target format changes, swapchain changes, and output-chain changes)
@@ -57,12 +59,13 @@ The exact MCP schema can evolve, but the current workflow is built around these 
 
 - `devkit_trace_output_chain` (walk backwards from backbuffer through RTV/UAV/Copy → SRV links; detects UI boundary and format bottlenecks)
 - `devkit_classify_postprocess` (heuristically classifies passes in the output chain into tonemap/grade, LUT, bloom, sharpen, HDR10/scRGB/SDR output, copy/resolve, and surfaces detected LUT handles)
-- `devkit_list_shaders`
+- `devkit_check_upgrade_candidates` (analyzes RGBA8/BGRA8/R11G11B10F/RGB10A2 targets in the output chain or full snapshot, checks usage/MSAA/mips/array/aspect/copy-mismatch/view-aliasing risks and tracked-resource blast radius, and generates ready-to-paste `ResourceUpgradeInfo` C++ snippets for `addon.cpp`)
+- `devkit_list_shaders` (supports `stage` and `bypassedOnly` filters)
 - `devkit_list_draws` (supports `writesBackbuffer`, `isFullscreenPass`, `blendEnabled`, stage, hash, and binding-count filters)
 - `devkit_get_draw`
 - `devkit_get_draw_constants` (reads bound CBVs/UBOs via snapshot cache or live GPU staging readback plus captured push constants formatted as `float4`/`uint32`, with optional `saveAs` baseline)
 - `devkit_diff_draw_constants` (diffs a saved constants baseline against another baseline or a fresh live read of a draw to pinpoint changed `cbN[reg].xyzw` and push-constant offsets)
-- `devkit_get_shader`
+- `devkit_get_shader` (supports `view`/`views` disassembly & decompilation, `startLine`/`lineCount` line-range paging, and `includeSnapshotContext` binding table `tN`/`uN`/`rtvN`/`cbN`)
 - `devkit_set_shader_bypass` (enable/disable live draw/dispatch bypass for a shader hash)
 
 ### Resource inspection, 3D LUT analysis & batch HDR scan

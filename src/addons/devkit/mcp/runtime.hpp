@@ -14,6 +14,7 @@
 #include "../../../utils/mcp/server.hpp"
 #include "../../../utils/mcp/arguments.hpp"
 #include "deep_analysis.hpp"
+#include "device_proxy.hpp"
 #include "live_shaders.hpp"
 #include "output_chain.hpp"
 #include "resource_analysis.hpp"
@@ -22,12 +23,15 @@
 #include "snapshot_tools.hpp"
 #include "texture_replace.hpp"
 #include "tool_catalog.hpp"
+#include "upgrade_candidates.hpp"
 
 namespace renodx::addons::devkit::mcp::runtime {
 
 struct RegistrationContext {
   std::function<snapshot_tools::ToolContext()> build_snapshot_tools_context;
   std::function<output_chain::ToolContext()> build_output_chain_tool_context;
+  std::function<upgrade_candidates::ToolContext()> build_upgrade_candidates_tool_context;
+  std::function<device_proxy::ToolContext()> build_device_proxy_tool_context;
   std::function<deep_analysis::ToolContext()> build_deep_analysis_tool_context;
   std::function<shader_inspection::ToolContext()> build_shader_inspection_tool_context;
   std::function<live_shaders::ToolContext()> build_live_shaders_tool_context;
@@ -211,6 +215,18 @@ inline void RegisterTools(renodx::utils::mcp::Server& server, const Registration
   });
   register_tool("devkit_get_trace_log", [](const renodx::utils::mcp::json& arguments) {
     return deep_analysis::HandleGetTraceLogTool(arguments);
+  });
+  register_tool("devkit_get_device_proxy_state", [build_device_proxy_tool_context = context.build_device_proxy_tool_context](
+                                                     const renodx::utils::mcp::json& arguments) {
+    return device_proxy::HandleGetDeviceProxyStateTool(arguments, build_device_proxy_tool_context());
+  });
+  register_tool("devkit_set_device_proxy_mode", [build_device_proxy_tool_context = context.build_device_proxy_tool_context](
+                                                    const renodx::utils::mcp::json& arguments) {
+    return device_proxy::HandleSetDeviceProxyModeTool(arguments, build_device_proxy_tool_context());
+  });
+  register_tool("devkit_check_upgrade_candidates", [build_upgrade_candidates_tool_context = context.build_upgrade_candidates_tool_context](
+                                                       const renodx::utils::mcp::json& arguments) {
+    return upgrade_candidates::HandleCheckUpgradeCandidatesTool(arguments, build_upgrade_candidates_tool_context());
   });
 }
 
