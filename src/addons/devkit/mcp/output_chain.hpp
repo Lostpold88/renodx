@@ -15,6 +15,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -407,10 +408,14 @@ struct ToolContext {
 }
 
 [[nodiscard]] inline bool IsLikelyLutEndpoint(const ResourceEndpoint& endpoint) {
-  if (endpoint.type == "texture_3d"
+  // Color LUTs are cubic RGB volumes; this skips e.g. Unreal's 20x12x32 r32g32 local exposure grid.
+  const auto channels = std::string_view(endpoint.format).substr(0u, endpoint.format.find('_'));
+  const bool has_rgb = channels.find('r') != std::string_view::npos
+                       && channels.find('g') != std::string_view::npos
+                       && channels.find('b') != std::string_view::npos;
+  if (endpoint.type == "texture_3d" && has_rgb
       && endpoint.width >= 4u && endpoint.width <= 128u
-      && endpoint.height >= 4u && endpoint.height <= 128u
-      && endpoint.depth_or_layers >= 4u && endpoint.depth_or_layers <= 128u) {
+      && endpoint.width == endpoint.height && endpoint.height == endpoint.depth_or_layers) {
     return true;
   }
   if (endpoint.type == "texture_2d") {

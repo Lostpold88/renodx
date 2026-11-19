@@ -723,6 +723,23 @@ inline void EncodePreviewPixel(
   }
 }
 
+// Color LUTs map RGB to RGB; 1- and 2-channel volumes (local exposure grids, histograms) are not color LUTs.
+[[nodiscard]] inline bool HasFewerThanThreeChannels(reshade::api::format format) {
+  switch (format) {
+    case reshade::api::format::r8_unorm:
+    case reshade::api::format::r8g8_unorm:
+    case reshade::api::format::r16_unorm:
+    case reshade::api::format::r16_float:
+    case reshade::api::format::r16g16_unorm:
+    case reshade::api::format::r16g16_float:
+    case reshade::api::format::r32_float:
+    case reshade::api::format::r32g32_float:
+      return true;
+    default:
+      return false;
+  }
+}
+
 struct MappedTextureReadback {
   reshade::api::device* device = nullptr;
   reshade::api::resource staging = {0u};
@@ -1775,6 +1792,17 @@ struct MappedTextureReadback {
     };
   }
 
+  if (HasFewerThanThreeChannels(analysis_format)) {
+    const auto error = std::format(
+        "Format {} has fewer than 3 channels, so this is not a color LUT (likely an exposure grid or histogram). Use devkit_analyze_resource instead.",
+        FormatFormat(context, analysis_format));
+    return ToolResult{
+        .text = error,
+        .structured_content = json{{"error", error}},
+        .is_error = true,
+    };
+  }
+
   MappedTextureReadback readback;
   std::string readback_error;
   if (!readback.Acquire(
@@ -1981,6 +2009,8 @@ struct MappedTextureReadback {
     return neutral_samples[i0].lum + (frac * (neutral_samples[i1].lum - neutral_samples[i0].lum));
   };
 
+  // Sampled at LUT coordinates, not scene values: the input shaper (sRGB, log, PQ) is unknown here.
+  const double lum_010 = interp_neutral_lum(0.10);
   const double lum_018 = interp_neutral_lum(0.18);
   const double lum_025 = interp_neutral_lum(0.25);
   const double lum_050 = interp_neutral_lum(0.50);
@@ -2012,10 +2042,20 @@ struct MappedTextureReadback {
     estimated_input_space = "linear_to_encoded_gamma";
   } else if (mae_srgb_to_lin < mae_identity * 0.7 && mae_srgb_to_lin < 0.12) {
     estimated_input_space = "encoded_to_linear";
-  } else if (lum_018 > 0.34 && lum_050 > 0.65 && lum_100 <= 1.05) {
+  } else if ((lum_018 > 0.34 && lum_050 > 0.65 && lum_100 <= 1.05)
+             // Log/PQ shaper baked with a tonemap: crushed toe, steep mids, flat shoulder (e.g. Unreal's 32^3 log LUT)
+             || (lum_010 < 0.02 && midtone_slope > 0.1 && shoulder_slope < (midtone_slope * 0.2) && lum_100 <= 1.05)) {
     estimated_input_space = "log_or_hdr_shaper_to_sdr";
   } else if (identity_max_delta < 0.005) {
     estimated_input_space = "identity_space_preserving";
+  }
+
+  // Gamma and identity comparisons assume a linear or gamma-encoded input axis; on a shaped axis they mean nothing.
+  const bool shaped_input_axis = estimated_input_space == "log_or_hdr_shaper_to_sdr";
+  if (shaped_input_axis) {
+    for (auto& entry : neutral_axis_json) {
+      entry["effectiveGamma"] = nullptr;
+    }
   }
 
   const auto make_corner_json = [&](const char* name, uint32_t r, uint32_t g, uint32_t b, std::optional<double> ref_hue_deg) {
@@ -2174,13 +2214,13 @@ struct MappedTextureReadback {
       {"identity", {
                        {"maxDelta", identity_max_delta},
                        {"meanDelta", identity_mean_delta},
-                       {"isNearIdentity", identity_max_delta < 0.005},
+                       {"isNearIdentity", shaped_input_axis ? json(nullptr) : json(identity_max_delta < 0.005)},
                    }},
       {"neutralAxisSummary", {
                                  {"blackLift", black_lift},
                                  {"whiteLuminance", white_lum},
-                                 {"luminanceAt018", lum_018},
-                                 {"luminanceAt050", lum_050},
+                                 {"luminanceAtCoord018", lum_018},
+                                 {"luminanceAtCoord050", lum_050},
                                  {"midtoneSlope", midtone_slope},
                                  {"shoulderSlope", shoulder_slope},
                                  {"monotonic", neutral_monotonic},
