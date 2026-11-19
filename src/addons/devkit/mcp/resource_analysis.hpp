@@ -1965,6 +1965,7 @@ struct MappedTextureReadback {
   neutral_samples.reserve(diag_steps);
   json neutral_axis_json = json::array();
   bool neutral_monotonic = true;
+  double max_neutral_chroma_error = 0.0;
   double err_identity = 0.0;
   double err_lin_to_srgb = 0.0;
   double err_srgb_to_lin = 0.0;
@@ -1981,6 +1982,7 @@ struct MappedTextureReadback {
     if (!neutral_samples.empty() && lum < neutral_samples.back().lum - 1e-4) {
       neutral_monotonic = false;
     }
+    max_neutral_chroma_error = std::max(max_neutral_chroma_error, chroma_err);
 
     neutral_samples.push_back(NeutralSample{
         .input = t,
@@ -2048,8 +2050,26 @@ struct MappedTextureReadback {
   const double mae_lin_to_srgb = err_lin_to_srgb / norm_steps;
   const double mae_srgb_to_lin = err_srgb_to_lin / norm_steps;
 
+  // First neutral-axis coordinate where luminance reaches 98% of white, interpolated between samples.
+  const auto white_reached_sample = std::ranges::find_if(neutral_samples, [lum_100](const NeutralSample& sample) { return sample.lum >= 0.98 * lum_100; });
+  double white_reached_coord = 1.0;
+  if (white_reached_sample != neutral_samples.end()) {
+    white_reached_coord = white_reached_sample->input;
+    if (white_reached_sample != neutral_samples.begin()) {
+      const auto& previous = *(white_reached_sample - 1);
+      const double span = white_reached_sample->lum - previous.lum;
+      if (span > 0.0) {
+        white_reached_coord = previous.input + ((white_reached_sample->input - previous.input) * (((0.98 * lum_100) - previous.lum) / span));
+      }
+    }
+  }
+
   std::string estimated_input_space = "encoded_sdr_srgb_or_gamma22";
-  if (global_max > 1.05) {
+  if (!neutral_monotonic && (global_min < -0.05 || max_neutral_chroma_error > 0.3)) {
+    // A color LUT's neutral axis rises with its input and stays near gray; a signed or strongly tinted non-monotonic
+    // volume is some other 3D data.
+    estimated_input_space = "not_a_color_lut";
+  } else if (global_max > 1.05) {
     estimated_input_space = "hdr_linear_or_extended";
   } else if (mae_lin_to_srgb < mae_identity * 0.7 && mae_lin_to_srgb < 0.12) {
     estimated_input_space = "linear_to_encoded_gamma";
@@ -2058,10 +2078,9 @@ struct MappedTextureReadback {
   } else if ((lum_018 > 0.34 && lum_050 > 0.65 && lum_100 <= 1.05)
              // Log/PQ shaper baked with a tonemap: crushed toe, steep mids, flat shoulder (e.g. Unreal's 32^3 log LUT)
              || (lum_010 < 0.02 && midtone_slope > 0.1 && shoulder_slope < (midtone_slope * 0.2) && lum_100 <= 1.05)) {
-    // A PQ axis spans 0..10000 nits, so SDR white is reached early; a log axis (e.g. Unreal) fills nearly the whole range.
-    const auto white_reached = std::ranges::find_if(neutral_samples, [lum_100](const NeutralSample& sample) { return sample.lum >= 0.98 * lum_100; });
-    const bool white_reached_early = white_reached != neutral_samples.end() && white_reached->input < 0.8;
-    estimated_input_space = (white_reached_early ? "pq_shaper_to_sdr" : "log_shaper_to_sdr");
+    // A PQ axis reaches SDR white around coord 0.5-0.65 (it spans 0..10000 nits); a log axis (e.g. Unreal) around 0.75-0.9.
+    // Coords in between stay undecided instead of flipping on a hard threshold.
+    estimated_input_space = (white_reached_coord < 0.65 ? "pq_shaper_to_sdr" : (white_reached_coord > 0.75 ? "log_shaper_to_sdr" : "pq_or_log_shaper_to_sdr"));
   } else if (identity_max_delta < 0.005) {
     estimated_input_space = "identity_space_preserving";
   }
@@ -2242,6 +2261,7 @@ struct MappedTextureReadback {
                                  {"monotonic", neutral_monotonic},
                                  {"bakedTonemapAssessment", baked_tonemap_assessment},
                                  {"estimatedInputSpace", estimated_input_space},
+                                 {"whiteReachedAtCoord", white_reached_coord},
                                  {"curveErrors", {
                                                      {"maeIdentity", mae_identity},
                                                      {"maeLinearToGamma22", mae_lin_to_srgb},

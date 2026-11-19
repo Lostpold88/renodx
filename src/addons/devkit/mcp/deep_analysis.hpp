@@ -851,7 +851,7 @@ inline void ProcessPendingConstantsRequests(
   }
 
   auto text = std::format(
-      "Returned {} trace line(s) (offset {} of {} matched; {} total captured, generation {}).",
+      "Returned {} trace line(s) (offset {} of {} matched; {} total captured, generation {}). Entry index is the line position in the captured trace, not a snapshot draw index.",
       paged.size(),
       clamped_offset,
       total_matched,

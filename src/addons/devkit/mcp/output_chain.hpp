@@ -12,10 +12,10 @@
 #include <deque>
 #include <format>
 #include <functional>
-#include <initializer_list>
 #include <map>
 #include <optional>
 #include <set>
+#include <utility>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -80,6 +80,8 @@ struct DrawNode {
   std::vector<std::string> shader_hashes;
   bool blend_enabled = false;
   bool additive_blend = false;
+  // Blending or a partial color write mask keeps part of the previous target contents.
+  bool reads_destination = false;
   bool writes_backbuffer = false;
   bool is_fullscreen_pass = false;
   std::uint32_t element_count = 0u;
@@ -231,7 +233,12 @@ struct ToolContext {
       backbuffer_writer_indices.push_back(draw.draw_index);
       const bool is_copy_method = (draw.method == "Copy" || draw.method == "CopyResource" || draw.method == "CopyTextureRegion");
       // A fullscreen post pass is a single quad/triangle (<= 6 elements) or a compute dispatch (0); UI batches are larger.
-      if (is_copy_method || (draw.is_fullscreen_pass && !draw.blend_enabled && draw.element_count <= 6u)) {
+      // A copy only counts as the final pass when something in the snapshot produced its source; a copy of an
+      // unseen resource (e.g. a frame-generation output) would end the chain after one pass.
+      const bool copies_produced_source = std::ranges::any_of(draw.inputs, [&producers_by_resource](const ResourceEndpoint& input) {
+        return producers_by_resource.contains(input.resource_handle);
+      });
+      if ((is_copy_method && copies_produced_source) || (draw.is_fullscreen_pass && !draw.blend_enabled && draw.element_count <= 6u)) {
         last_opaque_fullscreen_backbuffer_draw = draw.draw_index;
       }
     }
@@ -245,6 +252,7 @@ struct ToolContext {
     trace.seed_draw_indices.push_back(last_opaque_fullscreen_backbuffer_draw.value());
     for (const auto bb_draw_index : backbuffer_writer_indices) {
       if (bb_draw_index <= last_opaque_fullscreen_backbuffer_draw.value()) continue;
+      if (graph.draws[bb_draw_index].method == "Copy") continue;  // present copy, not UI
       if (!trace.ui_start_draw_index.has_value()) {
         trace.ui_start_draw_index = bb_draw_index;
       }
@@ -280,20 +288,29 @@ struct ToolContext {
     if (current_depth >= max_depth) continue;
 
     const auto& current_draw = graph.draws[current_index];
-    for (const auto& input : current_draw.inputs) {
-      if (input.resource_handle == 0u) continue;
-      const auto prod_it = producers_by_resource.find(input.resource_handle);
-      if (prod_it == producers_by_resource.end()) continue;
+    const auto link_latest_producer = [&](const ResourceEndpoint& endpoint) {
+      if (endpoint.resource_handle == 0u) return;
+      const auto prod_it = producers_by_resource.find(endpoint.resource_handle);
+      if (prod_it == producers_by_resource.end()) return;
 
       const auto& writers = prod_it->second;
       const auto bound = std::lower_bound(writers.begin(), writers.end(), current_index);
-      if (bound == writers.begin()) continue;
+      if (bound == writers.begin()) return;
 
       const auto producer_index = *std::prev(bound);
       upstream_by_draw[current_index].insert(producer_index);
       if (!depth_by_draw.contains(producer_index)) {
         depth_by_draw[producer_index] = current_depth + 1u;
         work_queue.push_back(producer_index);
+      }
+    };
+    for (const auto& input : current_draw.inputs) {
+      link_latest_producer(input);
+    }
+    // The previous writer of each target is an upstream pass when the draw keeps part of its contents.
+    if (current_draw.reads_destination) {
+      for (const auto& output : current_draw.outputs) {
+        link_latest_producer(output);
       }
     }
   }
@@ -306,6 +323,7 @@ struct ToolContext {
   }
   std::ranges::sort(sorted_draw_indices);
 
+  std::set<std::pair<std::uint64_t, std::string>> reported_bottlenecks;
   trace.chain.reserve(sorted_draw_indices.size());
   for (const auto draw_index : sorted_draw_indices) {
     const auto& draw = graph.draws[draw_index];
@@ -325,7 +343,8 @@ struct ToolContext {
       } else if (output.is_r11g11b10f) {
         reason = "r11g11b10f_clips_below_0";
       }
-      if (!reason.empty()) {
+      // A target rewritten by many passes is one bottleneck; report it at the first pass that writes it.
+      if (!reason.empty() && reported_bottlenecks.emplace(output.resource_handle, reason).second) {
         trace.format_bottlenecks.push_back(FormatBottleneck{
             .draw_index = draw.draw_index,
             .shader_hashes = draw.shader_hashes,
@@ -487,6 +506,20 @@ struct ToolContext {
     if (backbuffer_width > 0u) break;
   }
 
+  // UI draws are numerous; report one ui_hud entry per distinct shader set instead of one per draw.
+  std::map<std::vector<std::string>, json> ui_groups;
+  const auto add_to_ui_group = [&ui_groups](const std::vector<std::string>& shader_hashes, std::uint32_t draw_index) {
+    auto& group = ui_groups.try_emplace(shader_hashes, json{
+                                                           {"firstDrawIndex", draw_index},
+                                                           {"shaderHashes", shader_hashes},
+                                                           {"roles", json::array({"ui_hud"})},
+                                                           {"drawCount", 0u},
+                                                       }).first->second;
+    group["drawCount"] = group["drawCount"].get<std::uint32_t>() + 1u;
+    group["firstDrawIndex"] = std::min(group["firstDrawIndex"].get<std::uint32_t>(), draw_index);
+    group["lastDrawIndex"] = std::max(group.value("lastDrawIndex", draw_index), draw_index);
+  };
+
   json classified_passes = json::array();
   json detected_luts = json::array();
   std::unordered_set<std::uint64_t> seen_lut_handles;
@@ -543,7 +576,6 @@ struct ToolContext {
 
     // Shader code evidence from the disassembly (decimal float literals, so prefixes tolerate rounding).
     bool has_pq_constants = false;
-    bool looks_like_cas = false;
     if (context.get_disassembly && !is_copy && pass.depth_from_output <= 2u) {
       for (const auto& hash_text : pass.shader_hashes) {
         std::uint32_t shader_hash = 0u;
@@ -552,15 +584,6 @@ struct ToolContext {
           continue;
         }
         const auto disassembly = context.get_disassembly(device_index, shader_hash);
-        const auto count_of = [&disassembly](std::initializer_list<std::string_view> needles) {
-          std::size_t count = 0u;
-          for (const auto needle : needles) {
-            for (auto pos = disassembly.find(needle); pos != std::string::npos; pos = disassembly.find(needle, pos + needle.size())) {
-              ++count;
-            }
-          }
-          return count;
-        };
         // ST 2084 constants m1 = 0.1593017578125, m2 = 78.84375, c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875.
         std::size_t pq_constant_hits = 0u;
         for (const auto* const constant : {"0.1593", "78.84", "0.8359", "18.85", "18.68"}) {
@@ -569,11 +592,6 @@ struct ToolContext {
           }
         }
         has_pq_constants = has_pq_constants || pq_constant_hits >= 4u;
-        // AMD CAS: a 5..9 tap neighborhood combined with min/max clamping and a reciprocal.
-        const auto tap_count = count_of({"sample_", "sample ", "ld_", "ld ", "gather4", "OpImageSample", "OpImageFetch", "OpImageGather"});
-        looks_like_cas = looks_like_cas
-                         || (tap_count >= 5u && tap_count <= 9u && count_of({"min ", "FMin", "NMin"}) > 0u
-                             && count_of({"max ", "FMax", "NMax"}) > 0u && count_of({"rcp ", "OpFDiv"}) > 0u);
       }
     }
 
@@ -605,9 +623,11 @@ struct ToolContext {
       roles.emplace_back("pq_encode");
       evidence.emplace_back("shader contains SMPTE ST 2084 PQ constants");
     }
-    if (looks_like_cas) {
-      roles.emplace_back("sharpen_cas");
-      evidence.emplace_back("5-9 texture taps with min/max clamping and a reciprocal (contrast adaptive sharpening)");
+
+    // Blended draws onto the backbuffer ahead of the final pass (e.g. UI drawn into a frame-generation input buffer).
+    if (pass.writes_backbuffer && pass.blend_enabled && pass.depth_from_output > 0u) {
+      add_to_ui_group(pass.shader_hashes, pass.draw_index);
+      continue;
     }
 
     if (writes_hdr10_bb) {
@@ -668,17 +688,8 @@ struct ToolContext {
     });
   }
 
-  // UI draws are numerous; report one ui_hud entry per distinct shader set instead of one per draw.
-  std::map<std::vector<std::string>, json> ui_groups;
   for (const auto& ui_draw : trace.ui_draws) {
-    auto& group = ui_groups.try_emplace(ui_draw.shader_hashes, json{
-                                                                   {"firstDrawIndex", ui_draw.draw_index},
-                                                                   {"shaderHashes", ui_draw.shader_hashes},
-                                                                   {"roles", json::array({"ui_hud"})},
-                                                                   {"drawCount", 0u},
-                                                               }).first->second;
-    group["drawCount"] = group["drawCount"].get<std::uint32_t>() + 1u;
-    group["lastDrawIndex"] = ui_draw.draw_index;
+    add_to_ui_group(ui_draw.shader_hashes, ui_draw.draw_index);
   }
   for (const auto& [shader_hashes, group] : ui_groups) {
     (void)shader_hashes;

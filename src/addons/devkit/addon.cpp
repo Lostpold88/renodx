@@ -4469,6 +4469,23 @@ void SetShaderDrawBypass(ShaderDetails& details, bool bypass) {
     }
   }
 
+  // Streamline DLSS-G renders into a fake swapchain buffer and presents a frame-generated copy of it through passes
+  // DevKit cannot see, so the fake buffer stands in for the backbuffer.
+  std::unordered_set<uint64_t> fake_swapchain_set;
+  for (const auto& draw : device_data->draw_details_list) {
+    for (const auto& [rtv_index, rtv] : draw.render_targets) {
+      (void)rtv_index;
+      if (rtv.resource.handle != 0u && rtv.resource_reflection.find("fake-swapchain-buffer") != std::string::npos
+          && backbuffer_set.insert(rtv.resource.handle).second) {
+        fake_swapchain_set.insert(rtv.resource.handle);
+        graph.backbuffer_handles.push_back(rtv.resource.handle);
+        graph.backbuffer_handle_hexes.push_back(FormatHandle(rtv.resource.handle));
+      }
+    }
+  }
+  std::unordered_set<uint64_t> written_resources;
+  uint64_t last_fake_swapchain_copy_source = 0u;
+
   graph.draws.reserve(device_data->draw_details_list.size());
   for (size_t index = 0u; index < device_data->draw_details_list.size(); ++index) {
     const auto& draw = device_data->draw_details_list[index];
@@ -4485,6 +4502,16 @@ void SetShaderDrawBypass(ShaderDetails& details, bool bypass) {
         .is_fullscreen_pass = summary.is_fullscreen_pass,
         .element_count = summary.element_count,
     };
+    if (draw.blend_desc.has_value()) {
+      for (const auto& [rtv_index, rtv] : draw.render_targets) {
+        (void)rtv;
+        if (rtv_index >= 8u) continue;
+        const auto color_write_mask = static_cast<uint32_t>(draw.blend_desc->render_target_write_mask[rtv_index]) & 0x7u;
+        if (draw.blend_desc->blend_enable[rtv_index] || color_write_mask != 0x7u) {
+          node.reads_destination = true;
+        }
+      }
+    }
 
     for (const auto& [slot_space, srv] : draw.srv_binds) {
       if (srv.resource.handle == 0u) continue;
@@ -4573,6 +4600,30 @@ void SetShaderDrawBypass(ShaderDetails& details, bool bypass) {
           dst_is_bb,
           hdr10_backbuffer_set.contains(draw.copy_destination.handle),
           "copy_dst"));
+    }
+
+    if (fake_swapchain_set.contains(draw.copy_source.handle)) {
+      last_fake_swapchain_copy_source = draw.copy_source.handle;
+    }
+    // The frame-generated image DLSS-G presents is produced by a pass DevKit cannot see. A copy into the backbuffer
+    // whose source nothing wrote is taken to present the last fake swapchain buffer that was copied away.
+    if (node.method == "Copy" && node.writes_backbuffer && !node.inputs.empty() && last_fake_swapchain_copy_source != 0u
+        && !written_resources.contains(node.inputs.front().resource_handle)) {
+      reshade::api::resource_desc fake_desc = {};
+      renodx::utils::resource::GetResourceInfo(reshade::api::resource{last_fake_swapchain_copy_source}, [&](const auto& info) {
+        fake_desc = info.desc;
+      });
+      node.inputs.front() = BuildOutputChainEndpoint(
+          last_fake_swapchain_copy_source,
+          0u,
+          fake_desc,
+          reshade::api::format::unknown,
+          true,
+          false,
+          "copy_src");
+    }
+    for (const auto& output : node.outputs) {
+      written_resources.insert(output.resource_handle);
     }
 
     graph.draws.push_back(std::move(node));

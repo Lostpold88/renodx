@@ -668,7 +668,7 @@ inline const renodx::utils::mcp::ToolCatalog METADATA = {
         "devkit_get_trace_log",
         {
             .title = "Get Trace Log",
-            .description = "Retrieve the most recent in-memory 1-frame API trace captured by devkit_queue_trace, with optional case-insensitive substring filtering and pagination. Returns structured entries {index, event, args} by default, or raw lines with structured=false.",
+            .description = "Retrieve the most recent in-memory 1-frame API trace captured by devkit_queue_trace, with optional case-insensitive substring filtering and pagination. Returns structured entries {index, event, args} by default, or raw lines with structured=false. `index` is the line position in the captured trace, not a snapshot draw index.",
             .input_schema = {
                 .properties = {
                     {"structured", {.types = {"boolean"}}},
