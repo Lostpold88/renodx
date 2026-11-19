@@ -173,6 +173,8 @@ struct DrawSummary {
   std::optional<std::string> copy_source_handle = std::nullopt;
   std::optional<std::string> copy_destination_handle = std::nullopt;
   std::optional<std::string> active_shader_stage = std::nullopt;
+  // Why descriptor bindings are or are not resolved ("ok" or the first reason tracking was skipped).
+  std::string descriptor_tracking_status;
   std::optional<std::vector<SlotResourceBindingSummary>> srv_bindings = std::nullopt;
   std::optional<std::vector<SlotResourceBindingSummary>> uav_bindings = std::nullopt;
   std::optional<std::vector<ConstantBufferSummary>> constant_buffers = std::nullopt;
@@ -210,6 +212,9 @@ inline void to_json(json& j, const DrawSummary& value) {
   }
   if (value.active_shader_stage.has_value()) {
     j["activeShaderStage"] = value.active_shader_stage.value();
+  }
+  if (!value.descriptor_tracking_status.empty()) {
+    j["descriptorTrackingStatus"] = value.descriptor_tracking_status;
   }
   if (value.srv_bindings.has_value()) {
     j["srvBindings"] = value.srv_bindings.value();

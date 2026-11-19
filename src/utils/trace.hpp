@@ -37,7 +37,7 @@ static std::atomic_uint32_t trace_initial_frame_count = 0;
 static std::atomic_bool trace_all = false;
 static std::atomic_bool trace_capture_to_memory = false;
 static std::atomic_uint64_t trace_capture_generation = 0u;
-inline constexpr std::size_t MAX_CAPTURED_TRACE_LINES = 25000u;
+inline constexpr std::size_t MAX_CAPTURED_TRACE_LINES = 250000u;
 
 struct CapturedTraceSnapshot {
   std::uint64_t generation = 0u;

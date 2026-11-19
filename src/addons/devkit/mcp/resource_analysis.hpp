@@ -114,6 +114,8 @@ struct ProcessingContext {
   std::function<std::string(std::uint64_t value)> format_handle;
   std::function<std::string(reshade::api::format format)> format_format;
   std::function<resource_view_summary::ResourceViewSummary(reshade::api::resource_view resource_view, reshade::api::device* device)> build_resource_view_summary;
+  // True for a backbuffer whose swapchain color space is HDR10 (PQ-encoded BT.2020).
+  std::function<bool(reshade::api::device* device, reshade::api::resource resource)> is_hdr10_pq_backbuffer;
   std::function<bool(reshade::api::device* device)> suspend_live_shaders;
   std::function<void(reshade::api::device* device)> restore_live_shaders;
   std::function<void(std::uint32_t device_index, const std::shared_ptr<PendingRequest>& request)> requeue_request;
@@ -976,6 +978,8 @@ struct MappedTextureReadback {
     };
   }
 
+  const bool pq_encoded = context.is_hdr10_pq_backbuffer && context.is_hdr10_pq_backbuffer(device, target.resolved_resource);
+
   ToolResult tool_result = {
       .text = "Failed to map the readback resource.",
       .structured_content = json{{"error", "Failed to map the readback resource."}},
@@ -1132,19 +1136,40 @@ struct MappedTextureReadback {
           max_rgb_samples.push_back(std::max({rgba[0], rgba[1], rgba[2]}));
         }
 
+        // PQ-encoded values are BT.2020 code values; decode to linear and convert to BT.709 so the same
+        // negative-channel test measures how much of the image leaves BT.709.
+        std::array<double, 3> gamut_rgb = {rgba[0], rgba[1], rgba[2]};
+        if (pq_encoded) {
+          constexpr double PQ_M1 = 0.1593017578125;
+          constexpr double PQ_M2 = 78.84375;
+          constexpr double PQ_C1 = 0.8359375;
+          constexpr double PQ_C2 = 18.8515625;
+          constexpr double PQ_C3 = 18.6875;
+          std::array<double, 3> bt2020_linear = {};
+          for (std::size_t channel = 0u; channel < 3u; ++channel) {
+            const double encoded_power = std::pow(std::clamp(static_cast<double>(rgba[channel]), 0.0, 1.0), 1.0 / PQ_M2);
+            bt2020_linear[channel] = std::pow(std::max(encoded_power - PQ_C1, 0.0) / (PQ_C2 - (PQ_C3 * encoded_power)), 1.0 / PQ_M1);
+          }
+          gamut_rgb = {
+              (1.66049100 * bt2020_linear[0]) - (0.58764114 * bt2020_linear[1]) - (0.07284986 * bt2020_linear[2]),
+              (-0.12455047 * bt2020_linear[0]) + (1.13289990 * bt2020_linear[1]) - (0.00834942 * bt2020_linear[2]),
+              (-0.01815076 * bt2020_linear[0]) - (0.10057890 * bt2020_linear[1]) + (1.11872970 * bt2020_linear[2]),
+          };
+        }
+
         constexpr double GAMUT_EPS = -1e-4;
-        if (rgba[0] >= GAMUT_EPS && rgba[1] >= GAMUT_EPS && rgba[2] >= GAMUT_EPS) {
+        if (gamut_rgb[0] >= GAMUT_EPS && gamut_rgb[1] >= GAMUT_EPS && gamut_rgb[2] >= GAMUT_EPS) {
           ++gamut_bt709_pixels;
         } else {
-          const double p3_r = (0.82246197 * rgba[0]) + (0.17753803 * rgba[1]);
-          const double p3_g = (0.03319420 * rgba[0]) + (0.96680580 * rgba[1]);
-          const double p3_b = (0.01708263 * rgba[0]) + (0.07239744 * rgba[1]) + (0.91051993 * rgba[2]);
+          const double p3_r = (0.82246197 * gamut_rgb[0]) + (0.17753803 * gamut_rgb[1]);
+          const double p3_g = (0.03319420 * gamut_rgb[0]) + (0.96680580 * gamut_rgb[1]);
+          const double p3_b = (0.01708263 * gamut_rgb[0]) + (0.07239744 * gamut_rgb[1]) + (0.91051993 * gamut_rgb[2]);
           if (p3_r >= GAMUT_EPS && p3_g >= GAMUT_EPS && p3_b >= GAMUT_EPS) {
             ++gamut_dci_p3_pixels;
           } else {
-            const double bt2020_r = (0.62740390 * rgba[0]) + (0.32928304 * rgba[1]) + (0.04331307 * rgba[2]);
-            const double bt2020_g = (0.06909729 * rgba[0]) + (0.91954040 * rgba[1]) + (0.01136232 * rgba[2]);
-            const double bt2020_b = (0.01639144 * rgba[0]) + (0.08801331 * rgba[1]) + (0.89559525 * rgba[2]);
+            const double bt2020_r = (0.62740390 * gamut_rgb[0]) + (0.32928304 * gamut_rgb[1]) + (0.04331307 * gamut_rgb[2]);
+            const double bt2020_g = (0.06909729 * gamut_rgb[0]) + (0.91954040 * gamut_rgb[1]) + (0.01136232 * gamut_rgb[2]);
+            const double bt2020_b = (0.01639144 * gamut_rgb[0]) + (0.08801331 * gamut_rgb[1]) + (0.89559525 * gamut_rgb[2]);
             if (bt2020_r >= GAMUT_EPS && bt2020_g >= GAMUT_EPS && bt2020_b >= GAMUT_EPS) {
               ++gamut_bt2020_pixels;
             } else {
@@ -1416,7 +1441,7 @@ struct MappedTextureReadback {
                   {
                       "gamut",
                       {
-                          {"assumedColorSpace", "bt709_linear"},
+                          {"assumedColorSpace", pq_encoded ? "hdr10_pq_bt2020" : "bt709_linear"},
                           {"bt709", RatioStats(gamut_bt709_pixels, finite_pixel_count)},
                           {"dciP3Only", RatioStats(gamut_dci_p3_pixels, finite_pixel_count)},
                           {"bt2020Only", RatioStats(gamut_bt2020_pixels, finite_pixel_count)},

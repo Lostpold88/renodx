@@ -146,7 +146,7 @@ std::atomic_bool shaders_pane_show_pixel_shaders = true;
 std::atomic_bool shaders_pane_show_compute_shaders = true;
 
 std::atomic_bool setting_devkit_start_active = false;
-std::atomic_bool setting_keep_descriptor_tracking_in_idle = true;
+std::atomic_bool setting_keep_descriptor_tracking_in_idle = false;
 std::atomic_bool devkit_tracking_active = false;
 std::atomic_bool devkit_tracking_requested = false;
 std::atomic_bool snapshot_return_to_idle = false;
@@ -268,6 +268,8 @@ struct DrawDetails {
   uint64_t cmd_list_handle = 0u;
   uint32_t cmd_list_draw_index = 0u;
   uint32_t submission_order = 0u;
+  // Why SRV/UAV/CBV bindings are or are not resolved for this draw ("ok" or the first reason tracking was skipped).
+  std::string descriptor_tracking_status = "no_bound_pipeline";
   std::map<std::pair<uint32_t, uint32_t>, ResourceViewDetails> srv_binds;
   std::map<std::pair<uint32_t, uint32_t>, ResourceViewDetails> uav_binds;
   std::map<std::pair<uint32_t, uint32_t>, reshade::api::buffer_range> constants;
@@ -2673,11 +2675,12 @@ std::vector<DeviceData*> device_data_list;
     if (rtv_index == 0u && draw_details.viewport.has_value()
         && rt_desc.type != reshade::api::resource_type::buffer && rt_desc.texture.width > 0u && rt_desc.texture.height > 0u) {
       const auto& vp = draw_details.viewport.value();
-      // Clip the viewport to the target, then take the covered area share.
-      const float x0 = std::max(vp.x, 0.f);
-      const float y0 = std::max(vp.y, 0.f);
-      const float x1 = std::min(vp.x + vp.width, static_cast<float>(rt_desc.texture.width));
-      const float y1 = std::min(vp.y + vp.height, static_cast<float>(rt_desc.texture.height));
+      // Clip the viewport to the target, then take the covered area share. Vulkan flips Y with a negative height,
+      // so the extent is the span between the two edges either way.
+      const float x0 = std::max(std::min(vp.x, vp.x + vp.width), 0.f);
+      const float y0 = std::max(std::min(vp.y, vp.y + vp.height), 0.f);
+      const float x1 = std::min(std::max(vp.x, vp.x + vp.width), static_cast<float>(rt_desc.texture.width));
+      const float y1 = std::min(std::max(vp.y, vp.y + vp.height), static_cast<float>(rt_desc.texture.height));
       viewport_coverage = std::max(x1 - x0, 0.f) * std::max(y1 - y0, 0.f)
                           / (static_cast<float>(rt_desc.texture.width) * static_cast<float>(rt_desc.texture.height));
     }
@@ -2740,6 +2743,7 @@ std::vector<DeviceData*> device_data_list;
     draw_summary.copy_destination_handle = FormatHandle(draw_details.copy_destination.handle);
   }
 
+  draw_summary.descriptor_tracking_status = draw_details.descriptor_tracking_status;
   if (draw_details.IsDispatch()) {
     draw_summary.active_shader_stage = StreamToString(reshade::api::pipeline_stage::compute_shader);
   } else if (draw_details.IsDraw()) {
@@ -6924,8 +6928,12 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
             ? reshade::api::pipeline_stage::compute_shader
             : reshade::api::pipeline_stage::pixel_shader);
     if (bound_pipeline.handle != 0u) {
-      auto* pipeline_shader_details = renodx::utils::shader::GetPipelineShaderDetails(bound_pipeline);
-      if (pipeline_shader_details != nullptr) {
+      std::optional<reshade::api::pipeline_layout> pipeline_layout = std::nullopt;
+      renodx::utils::shader::GetPipelineShaderDetails(bound_pipeline, [&pipeline_layout](const auto& details) {
+        pipeline_layout = details.layout;
+      });
+      draw_details.descriptor_tracking_status = "pipeline_details_missing";
+      if (pipeline_layout.has_value()) {
         const auto descriptor_table_state = renodx::utils::state::CopyBoundDescriptorTables(
             cmd_list,
             draw_method == DrawDetails::DrawMethods::DISPATCH
@@ -6934,12 +6942,26 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
         if (!descriptor_table_state.has_value()) return false;
         const auto& bound_pipeline_layout = descriptor_table_state->layout;
         const auto& bound_descriptor_tables = descriptor_table_state->tables;
-        if (bound_pipeline_layout == pipeline_shader_details->layout) {
+        // Vulkan accepts compatible but distinct layouts, so a differing handle does not stop the lookup.
+        draw_details.descriptor_tracking_status = (bound_pipeline_layout == pipeline_layout.value() ? "ok" : "ok_layout_handle_differs");
+        {
           const bool has_reflected_resource_binds = draw_details.resource_binds.has_value() && !draw_details.resource_binds->empty();
           auto* descriptor_data = renodx::utils::data::Get<renodx::utils::descriptor::DeviceData>(device);
           if (descriptor_data == nullptr) return false;
 
-          renodx::utils::pipeline_layout::GetPipelineLayoutData(pipeline_shader_details->layout, [&](const auto& local_layout_data) {
+          struct DescriptorTrackingCounters {
+            uint32_t params = 0u;
+            uint32_t params_without_table = 0u;
+            uint32_t ranges = 0u;
+            uint32_t heap_unknown = 0u;
+            uint32_t offset_invalid = 0u;
+            uint32_t candidates = 0u;
+            uint32_t not_a_view = 0u;
+            uint32_t resolved = 0u;
+            // First descriptor that was not a resource view: its type, heap offset, heap size and heap handle.
+            std::optional<std::string> first_not_a_view = std::nullopt;
+          } counters;
+          const bool layout_data_found = renodx::utils::pipeline_layout::GetPipelineLayoutData(pipeline_layout.value(), [&](const auto& local_layout_data) {
             const auto& info = *local_layout_data;
             auto param_count = info.params.size();
 
@@ -6948,6 +6970,8 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
 
               const auto& param = info.params.at(param_index);
               const auto& table = bound_descriptor_tables[param_index];
+              ++counters.params;
+              if (table.handle == 0u) ++counters.params_without_table;
 
               uint32_t descriptor_table_count;
               const reshade::api::descriptor_range* descriptor_table_ranges;
@@ -6996,6 +7020,7 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
                   continue;
                 }
 
+                ++counters.ranges;
                 uint32_t base_offset = 0;
                 reshade::api::descriptor_heap heap = {0};
                 device->get_descriptor_heap_offset(table, range.binding, 0, &heap, &base_offset);
@@ -7003,11 +7028,13 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
                 auto heap_pair = descriptor_data->heaps.find(heap.handle);
                 if (heap_pair == descriptor_data->heaps.end()) {
                   // Unknown heap?
+                  ++counters.heap_unknown;
                   continue;
                 }
                 const auto& heap_data = heap_pair->second;
                 if (base_offset >= heap_data.size()) {
                   // Invalid location (may be oversized bind)
+                  ++counters.offset_invalid;
                   continue;
                 }
                 const auto available_descriptor_count = static_cast<uint32_t>(heap_data.size() - base_offset);
@@ -7072,6 +7099,7 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
                 }
 
                 const bool use_uav = range_bind_type == ResourceBind::BindType::UAV;
+                counters.candidates += static_cast<uint32_t>(candidate_slots.size());
 
                 for (const auto& candidate : candidate_slots) {
                   const auto offset = base_offset + candidate.index;
@@ -7089,6 +7117,13 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
                   }
 
                   if (!descriptor.HasResourceView()) {
+                    ++counters.not_a_view;
+                    if (!counters.first_not_a_view.has_value()) {
+                      counters.first_not_a_view = std::format(
+                          "type={} offset={} heap_size={} heap=0x{:X} table=0x{:X} range_binding={} range_type={}",
+                          static_cast<uint32_t>(descriptor.type), offset, heap_data.size(), heap.handle, table.handle,
+                          range.binding, static_cast<uint32_t>(range.type));
+                    }
                     if (use_uav) {
                       draw_details.uav_binds.erase(slot);
                     } else {
@@ -7101,6 +7136,7 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
                   if (resource_view.handle != 0u) {
                     auto& cached = get_cached_resource_view_details(resource_view);
                     if (cached.details.resource.handle != 0u || !is_cached_resource_view_empty(cached, resource_view)) {
+                      ++counters.resolved;
                       if (use_uav) {
                         draw_details.uav_binds[slot] = cached.details;
                       } else {
@@ -7119,6 +7155,12 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
               }
             }
           });
+          draw_details.descriptor_tracking_status = std::format(
+              "{} layout_data={} params={} params_without_table={} ranges={} heap_unknown={} offset_invalid={} candidates={} "
+              "not_a_view={} resolved={} first_not_a_view=[{}]",
+              draw_details.descriptor_tracking_status, layout_data_found, counters.params, counters.params_without_table,
+              counters.ranges, counters.heap_unknown, counters.offset_invalid, counters.candidates, counters.not_a_view,
+              counters.resolved, counters.first_not_a_view.value_or("none"));
         }
       }
     }
@@ -11178,6 +11220,15 @@ void OnPresent(
             .format_handle = [](uint64_t value) { return FormatHandle(value); },
             .format_format = [](reshade::api::format format) { return StreamToString(format); },
             .build_resource_view_summary = [](reshade::api::resource_view resource_view, reshade::api::device* device) { return BuildResourceViewSummary(GetResourceViewDetails(resource_view, device)); },
+            .is_hdr10_pq_backbuffer = [device_data](reshade::api::device*, reshade::api::resource resource) {
+              std::shared_lock device_lock(device_data->mutex);
+              return std::ranges::any_of(device_data->swapchain_runtime_info, [resource](const auto& entry) {
+                const auto& [swapchain_ptr, rt_info] = entry;
+                (void)swapchain_ptr;
+                return rt_info.color_space == reshade::api::color_space::hdr10_st2084
+                       && std::ranges::find(rt_info.backbuffer_handles, resource.handle) != rt_info.backbuffer_handles.end();
+              });
+            },
             .suspend_live_shaders = SuspendLiveShadersForAb,
             .restore_live_shaders = RestoreLiveShadersForAb,
             .requeue_request = [](uint32_t idx, const std::shared_ptr<devkit_resource_analysis::PendingRequest>& req) {

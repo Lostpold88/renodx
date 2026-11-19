@@ -204,7 +204,7 @@ Response additions:
 - DevKit starts in **Idle (low-overhead) mode** by default (`StartActive=0`, with `KeepDescriptorTrackingInIdle=1` so static Vulkan/DX12 descriptor tables remain available for chain tracing). Use `devkit_set_tracking_active` to toggle hot-path hooks on/off at runtime, or pass `returnToIdle: true` to `devkit_queue_snapshot` (default when currently Idle) for one-shot capture.
 - Tool responses include serialized JSON in `content[0].text` alongside `structuredContent` for compatibility with MCP clients that only surface text content blocks.
 - 3D texture readback (`devkit_analyze_resource` and `devkit_analyze_lut`) automatically falls back to `copy_texture_to_buffer` staging buffers on APIs like Vulkan and D3D12 where `gpu_to_cpu` 3D textures are unsupported.
-- `devkit_get_swapchain_info` reports the graphics API, swapchain format/dimensions/backbuffer handles, color space, HDR status, and device proxy state.
+- `devkit_get_swapchain_info` reports the graphics API, swapchain format/dimensions/backbuffer handles, color space, HDR status, and device proxy state. `display` (DXGI output) and `gameHdrMetadata` (DXGI `SetHDRMetaData` hook) exist on DXGI swapchains only; on Vulkan they are `null` and `hooked: false`.
 - `devkit_list_resources` enumerates tracked GPU resources with type, format, dimension, backbuffer, and snapshot usage filters.
 - `devkit_set_shader_bypass` toggles live draw/dispatch bypass for a shader hash.
 - `devkit_trace_output_chain` walks backwards from swapchain backbuffer(s) through snapshot RTV/UAV/Copy → SRV links to locate the post-processing chain, UI/HUD boundary, and format bottlenecks.
@@ -224,3 +224,7 @@ Response additions:
 - `bridgeInfo` contains `name`, `title`, `version`, and when available `sourceDateEpoch` and `buildTimestampUtc`.
 - `serverInfo` contains the same fields for the connected devkit backend.
 - Agents can compare `version` and optionally `sourceDateEpoch` or `buildTimestampUtc` to detect an older bridge or backend.
+- `devkit_get_draw` and `devkit_list_draws` report `descriptorTrackingStatus` per draw: `ok`, `ok_layout_handle_differs` (the bound layout handle differs from the pipeline layout, as Vulkan permits for compatible layouts), `pipeline_details_missing`, or `no_bound_pipeline`. A draw with `srvBindings: []` and a status other than `ok` was not resolved, rather than binding nothing.
+- Readback gamut statistics report `assumedColorSpace`: `hdr10_pq_bt2020` for backbuffers of an HDR10 swapchain (PQ is decoded and converted to BT.709 before the negative-channel test), otherwise `bt709_linear`.
+- Viewports with a negative height (Vulkan's Y flip) are measured by the span between their edges.
+- The in-memory API trace holds up to 250000 lines per capture.
