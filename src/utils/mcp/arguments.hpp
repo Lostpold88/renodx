@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <cmath>
 #include <cstdint>
 #include <format>
 #include <limits>
@@ -78,8 +79,17 @@ template <typename T>
     }
 
     return static_cast<T>(signed_value);
+  } else if constexpr (std::is_floating_point_v<T>) {
+    if (!value.is_number()) {
+      throw std::runtime_error(std::format("{} must be a number.", key));
+    }
+    const auto floating_value = value.get<double>();
+    if (!std::isfinite(floating_value)) {
+      throw std::runtime_error(std::format("{} must be a finite number.", key));
+    }
+    return static_cast<T>(floating_value);
   } else {
-    static_assert(ALWAYS_FALSE<T>, "Argument access only supports std::string, bool, and integral types.");
+    static_assert(ALWAYS_FALSE<T>, "Argument access only supports std::string, bool, integral, and floating-point types.");
   }
 }
 

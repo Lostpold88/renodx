@@ -4325,6 +4325,38 @@ inline CommandListState* GetCurrentState(reshade::api::command_list* cmd_list) {
 
 static bool attached = false;
 
+inline bool enable_hot_path_events_on_attach = true;
+
+inline void SetHotPathEventsEnabled(bool enabled) {
+  if (!attached) return;
+  shared.RegisterEvent<reshade::addon_event::bind_render_targets_and_depth_stencil>(
+      OnBindRenderTargetsAndDepthStencil, enabled && (use_snapshot || use_render_target_tracking));
+  shared.RegisterEvent<reshade::addon_event::begin_render_pass>(
+      OnBeginRenderPass, enabled && (use_snapshot || use_render_target_tracking));
+  shared.RegisterEvent<reshade::addon_event::end_render_pass>(
+      OnEndRenderPass, enabled && (use_snapshot || use_render_target_tracking));
+  shared.RegisterEvent<reshade::addon_event::bind_pipeline_states>(
+      OnBindPipelineStates, enabled && (use_snapshot || use_dynamic_state_tracking));
+  shared.RegisterEvent<reshade::addon_event::bind_viewports>(
+      OnBindViewports, enabled && (use_snapshot || use_viewport_scissor_tracking));
+  shared.RegisterEvent<reshade::addon_event::bind_scissor_rects>(
+      OnBindScissorRects, enabled && (use_snapshot || use_viewport_scissor_tracking));
+  if (vertex_and_index_buffer_events_registered) {
+    shared.RegisterEvent<reshade::addon_event::bind_vertex_buffers>(
+        OnBindVertexBuffers, enabled && (use_snapshot || use_input_assembler_tracking));
+    shared.RegisterEvent<reshade::addon_event::bind_index_buffer>(
+        OnBindIndexBuffer, enabled && (use_snapshot || use_input_assembler_tracking));
+  }
+  shared.RegisterEvent<reshade::addon_event::push_constants>(
+      OnPushConstants, enabled && (use_snapshot || use_push_constants));
+  shared.RegisterEvent<reshade::addon_event::push_descriptors>(
+      OnPushDescriptors, enabled && (use_snapshot || use_push_descriptors));
+  shared.RegisterEvent<reshade::addon_event::bind_descriptor_tables>(
+      OnBindDescriptorTables,
+      enabled && (use_snapshot || use_descriptor_tables || use_push_constants || use_push_descriptors));
+  pipeline::RegisterOnBindCallback(OnBindPipeline, enabled && (use_snapshot || use_pipeline_tracking));
+}
+
 static void Use(DWORD fdw_reason) {
   switch (fdw_reason) {
     case DLL_PROCESS_ATTACH: {
@@ -4351,12 +4383,6 @@ static void Use(DWORD fdw_reason) {
       }
       shared.RegisterEvent<reshade::addon_event::init_command_list>(OnInitCommandList);
       shared.RegisterEvent<reshade::addon_event::destroy_command_list>(OnDestroyCommandList);
-      shared.RegisterEvent<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargetsAndDepthStencil, use_snapshot || use_render_target_tracking);
-      shared.RegisterEvent<reshade::addon_event::begin_render_pass>(OnBeginRenderPass, use_snapshot || use_render_target_tracking);
-      shared.RegisterEvent<reshade::addon_event::end_render_pass>(OnEndRenderPass, use_snapshot || use_render_target_tracking);
-      shared.RegisterEvent<reshade::addon_event::bind_pipeline_states>(OnBindPipelineStates, use_snapshot || use_dynamic_state_tracking);
-      shared.RegisterEvent<reshade::addon_event::bind_viewports>(OnBindViewports, use_snapshot || use_viewport_scissor_tracking);
-      shared.RegisterEvent<reshade::addon_event::bind_scissor_rects>(OnBindScissorRects, use_snapshot || use_viewport_scissor_tracking);
       // ReShade 6.8 allocates broken D3D9 Draw-UP buffers when either input-
       // assembler event has any subscribers. D3D9 snapshots use native getters,
       // so avoid registering the events at all on that backend.
@@ -4367,16 +4393,8 @@ static void Use(DWORD fdw_reason) {
           ARRAYSIZE(reshade_module_path));
       vertex_and_index_buffer_events_registered =
           _wcsicmp(std::filesystem::path(reshade_module_path).filename().c_str(), L"d3d9.dll") != 0;
-      if (vertex_and_index_buffer_events_registered) {
-        shared.RegisterEvent<reshade::addon_event::bind_vertex_buffers>(OnBindVertexBuffers, use_snapshot || use_input_assembler_tracking);
-        shared.RegisterEvent<reshade::addon_event::bind_index_buffer>(OnBindIndexBuffer, use_snapshot || use_input_assembler_tracking);
-      }
-      shared.RegisterEvent<reshade::addon_event::push_constants>(OnPushConstants, use_snapshot || use_push_constants);
-      shared.RegisterEvent<reshade::addon_event::push_descriptors>(OnPushDescriptors, use_snapshot || use_push_descriptors);
-      shared.RegisterEvent<reshade::addon_event::bind_descriptor_tables>(OnBindDescriptorTables,
-                                                                         use_snapshot || use_descriptor_tables || use_push_constants || use_push_descriptors);
       shared.RegisterEvent<reshade::addon_event::reset_command_list>(OnResetCommandList);
-      pipeline::RegisterOnBindCallback(OnBindPipeline, use_snapshot || use_pipeline_tracking);
+      SetHotPathEventsEnabled(enable_hot_path_events_on_attach);
 
       break;
     }

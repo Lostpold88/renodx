@@ -542,6 +542,15 @@ static void OnDestroyPipelineLayout(
   FreeAllocatedDescriptorTables(device, layout);
 }
 
+inline void SetTraceDescriptorTables(bool enabled) {
+  trace_descriptor_tables = enabled;
+  if (shared.data != nullptr) {
+    shared.data->trace_descriptor_tables = enabled;
+  }
+  shared.RegisterEvent<reshade::addon_event::update_descriptor_tables>(OnUpdateDescriptorTables, enabled);
+  shared.RegisterEvent<reshade::addon_event::copy_descriptor_tables>(OnCopyDescriptorTables, enabled);
+}
+
 static void Use(DWORD fdw_reason) {
   switch (fdw_reason) {
     case DLL_PROCESS_ATTACH:

@@ -39,31 +39,47 @@ The bridge advertises the DevKit tool surface up front. If there is exactly one 
 
 The exact MCP schema can evolve, but the current workflow is built around these groups.
 
-### Connection and frame state
+### Connection, tracking mode, and frame state
 
 - `renodx_list_connections`
 - `renodx_connect`
-- `devkit_status`
+- `devkit_status` (includes `tracking` Active/Idle state)
+- `devkit_set_tracking_active` (switch hot-path hooks between Active and Idle/low-overhead mode)
 - `devkit_select_device`
-- `devkit_queue_snapshot`
+- `devkit_get_swapchain_info` (API, format, color space, HDR signaling, backbuffer handles, proxy state)
+- `devkit_queue_snapshot` (supports `returnToIdle` for one-shot capture from Idle mode)
 - `devkit_snapshot_summary`
+- `devkit_compare_snapshots` (`action`: `"save"`, `"list"`, `"compare"` — diff two snapshot profiles for added/removed shaders, draw-count shifts, target format changes, swapchain changes, and output-chain changes)
+- `devkit_queue_trace` (queue a 1-frame API trace into the in-memory trace buffer and `ReShade.log`, with `returnToIdle` support)
+- `devkit_get_trace_log` (read, filter, and page captured in-memory trace log lines)
 
-### Frame inspection
+### Frame & pipeline inspection
 
+- `devkit_trace_output_chain` (walk backwards from backbuffer through RTV/UAV/Copy → SRV links; detects UI boundary and format bottlenecks)
+- `devkit_classify_postprocess` (heuristically classifies passes in the output chain into tonemap/grade, LUT, bloom, sharpen, HDR10/scRGB/SDR output, copy/resolve, and surfaces detected LUT handles)
 - `devkit_list_shaders`
-- `devkit_list_draws`
+- `devkit_list_draws` (supports `writesBackbuffer`, `isFullscreenPass`, `blendEnabled`, stage, hash, and binding-count filters)
 - `devkit_get_draw`
+- `devkit_get_draw_constants` (reads bound CBVs/UBOs via snapshot cache or live GPU staging readback plus captured push constants formatted as `float4`/`uint32`, with optional `saveAs` baseline)
+- `devkit_diff_draw_constants` (diffs a saved constants baseline against another baseline or a fresh live read of a draw to pinpoint changed `cbN[reg].xyzw` and push-constant offsets)
 - `devkit_get_shader`
+- `devkit_set_shader_bypass` (enable/disable live draw/dispatch bypass for a shader hash)
 
-### Resource inspection
+### Resource inspection, 3D LUT analysis & batch HDR scan
 
-- `devkit_analyze_resource`
+- `devkit_list_resources` (list tracked GPU resources with type, format, dimension, backbuffer, and snapshot RTV/UAV/SRV usage filters)
+- `devkit_analyze_resource` (supports 2D and 3D textures; includes `percentiles` p99/p99.9 and `gamut` BT.709/DCI-P3/BT.2020 breakdown; unwraps 3D previews into horizontal strips)
+- `devkit_analyze_lut` (reads back 3D textures `texture_3d` and 2D strip LUTs like `256x16` / `1024x32`; analyzes range/clipping, neutral axis curve, black lift, white point, baked-tonemap and input-space heuristics, primary/secondary hue & saturation shifts, and optionally exports `.cube`, `.json`, or unwrapped `.png`/`.exr`)
+- `devkit_scan_pass_resources` (single-frame batch GPU readback across explicit handles, draw indices, or `includeOutputChain: true` with `hdrDropOff` summary)
+- `devkit_compare_resource_ab` (automated 2-frame A/B GPU readback: Present 1 with live shader replacements active, Present 2 vanilla with live replacements temporarily suspended, returning luminance/p99/p99.9/HDR/WCG/NaN/gamut deltas)
 - `devkit_dump_resource_with_hash`
 - `devkit_set_resource_clone`
+- `devkit_replace_resource_with_file`
 
 ### Texture replacement rules (experimental)
 
 - `devkit_set_texture_replace_enabled`
+- `devkit_reload_texture_replace_boot_cache`
 - `devkit_set_texture_replace_rules`
 - `devkit_get_texture_replace_state`
 - `devkit_list_texture_replace_observations`
@@ -77,6 +93,7 @@ The exact MCP schema can evolve, but the current workflow is built around these 
 - `devkit_set_live_shader_path`
 - `devkit_load_live_shaders`
 - `devkit_unload_live_shaders`
+- `devkit_get_live_shader_status` (reports live shader directory, reload status, active runtime replacement count, per-shader compilation status & exact compiler error text, and `snapshotDrawCount`)
 
 Default devkit folder layout under the ReShade base path:
 
@@ -90,14 +107,16 @@ Texture replacement lookup checks `live` first, then the decoded `boot` cache.
 
 ## 4. Recommended investigation loop
 
-For a new game, work backward from the end of the frame.
+DevKit starts in **Idle (low-overhead) mode** by default (`StartActive=0`), keeping hot-path hooks (`draw`, `dispatch`, `bind_pipeline`, `state`, `trace`, `swapchain` render-pass hooks) unregistered during normal gameplay. `KeepDescriptorTrackingInIdle` defaults to `1` so static Vulkan/DX12 descriptor tables populated at boot remain tracked for `devkit_trace_output_chain` (can be disabled under Settings → `Other`). Calling `devkit_queue_snapshot` while Idle automatically activates tracking for the capture frame and returns to Idle right after (`returnToIdle` defaults to `true` when Idle). For full frame-0 tracking, enable **Start Active on Launch** (`StartActive=1` under `[renodx-dev]`) or call `devkit_set_tracking_active({ active: true })`.
 
-1. Connect and choose the active device.
-2. Queue a snapshot and wait for the next present.
-3. Inspect late draws first.
-4. Identify the likely scene composite, UI, and final blit stages.
-5. Inspect the candidate draw with `devkit_get_draw`.
-6. Read back the relevant resources with `devkit_analyze_resource`.
+For a new game, work backward from the end of the frame:
+
+1. Connect, check `devkit_status`, and select the active device with `devkit_select_device`.
+2. Inspect output format, color space, and backbuffers with `devkit_get_swapchain_info`.
+3. Queue a snapshot (`devkit_queue_snapshot`) and wait for the next present.
+4. Trace the post-processing pipeline backwards from the backbuffer with `devkit_trace_output_chain` to locate the UI/HUD boundary (`uiStartDrawIndex`) and UNORM/R11G11B10F/RGB10A2 format bottlenecks.
+5. Run a batch HDR/Gamut/NaN scan over the chain with `devkit_scan_pass_resources({ includeOutputChain: true })` to find the exact `hdrDropOff` pass.
+6. Use `devkit_get_draw`, `devkit_list_resources`, and `devkit_set_shader_bypass` to verify individual passes (e.g. isolating UI, bloom, vignette, or tonemap).
 7. Only after the target pass is clear, dump and edit shaders.
 
 This usually answers the important question first:
@@ -122,13 +141,14 @@ If one device shows `0` draws or `0` tracked shaders, it is usually not the one 
 
 ## 6. Reading frame structure
 
-Use `devkit_list_draws` to find likely late-frame candidates, then `devkit_get_draw` for the exact pass.
+Start with `devkit_trace_output_chain` for an automatic backwards graph from the swapchain backbuffer(s), or use `devkit_list_draws` (filtering by `writesBackbuffer`, `isFullscreenPass`, `blendEnabled`, `shaderHash`, or `method`) and `devkit_list_resources` to find specific targets, then `devkit_get_draw` for the exact pass.
 
 The useful fields are:
 
-- pixel and vertex shader hashes
-- render target view details and format
-- SRV inputs and format
+- pixel, compute, and vertex shader hashes
+- `writesBackbuffer`, `isFullscreenPass`, and `blendEnabled` flags
+- render target view and UAV details and formats
+- SRV inputs and formats
 - blend state
 - swapchain and clone flags
 
@@ -189,7 +209,8 @@ The safe loop is:
 4. point `devkit_set_tools_path` at your repo `bin` folder if the game has conflicting DXC DLLs
 5. point `devkit_set_live_shader_path` at that folder
 6. call `devkit_load_live_shaders`
-7. verify with `devkit_get_shader` that the source is `File`
+7. inspect compiler errors, active replacement count, and `snapshotDrawCount` via `devkit_get_live_shader_status` (or verify with `devkit_get_shader` that the source is `File`)
+8. run `devkit_compare_resource_ab` on the target pass or backbuffer to measure exact live-shader vs. vanilla luminance, p99/p99.9, HDR/WCG, NaN, and gamut deltas in two consecutive frames
 
 Keep the live shader folder clean:
 
@@ -224,14 +245,16 @@ Use `devkit_set_resource_clone` to enable cloning, then analyze the same resourc
 
 This is the authoritative way to answer whether the upgraded path is actually preserving HDR data.
 
-## 10. Dump formats
+## 10. Dump formats and batch HDR scanning
 
-`devkit_analyze_resource` can write both preview and HDR-preserving outputs.
+`devkit_analyze_resource` returns per-channel and luminance `min`/`max`/`mean`, **percentiles** (`luminanceP99`, `luminanceP999`, `maxRgbP99`, `maxRgbP999`), **gamut breakdown** (`bt709`, `dciP3Only`, `bt2020Only`, `outOfBt2020` assuming BT.709 linear), NaN/Inf/negative/>1.0 pixel counts, and can optionally write preview or HDR-preserving files:
 
 - `.png`
   SDR preview only
 - `.exr`
   HDR-preserving `RGBA16F` dump
+
+For scanning multiple passes in a single frame without writing files, use `devkit_scan_pass_resources` with `includeOutputChain: true`, `drawIndices`, `resourceViewHandles`, or `resourceHandles`. It returns per-target stats plus an `hdrDropOff` summary (`lastPassWithValuesAbove1`, `firstClippedPassAfterHdr`, `lastPassWithNegativeValues`, `firstPassWithNanOrInf`).
 
 Do not use the PNG alone to decide whether HDR survived. Use:
 

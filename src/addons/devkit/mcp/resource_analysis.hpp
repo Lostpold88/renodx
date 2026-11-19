@@ -6,6 +6,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -14,12 +15,15 @@
 #include <exception>
 #include <filesystem>
 #include <format>
+#include <fstream>
 #include <functional>
+#include <iomanip>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -51,8 +55,35 @@ enum class OutputFormat : std::uint8_t {
   EXR = 1,
 };
 
+struct ScanTargetSpec {
+  reshade::api::resource_view resource_view = {0u};
+  reshade::api::resource resource = {0u};
+  std::optional<std::uint32_t> draw_index = std::nullopt;
+  std::vector<std::string> shader_hashes;
+  std::string label;
+};
+
+struct LutAnalysisSpec {
+  std::string layout = "auto";
+  std::optional<std::uint32_t> lut_size = std::nullopt;
+  std::optional<std::filesystem::path> export_cube_path = std::nullopt;
+  std::optional<std::filesystem::path> export_json_path = std::nullopt;
+  std::optional<std::filesystem::path> export_preview_path = std::nullopt;
+};
+
+struct AbCompareSpec {
+  bool active = false;
+  std::uint8_t phase = 0u;
+  bool suspended_live_shaders = false;
+  std::optional<ToolResult> with_live_result = std::nullopt;
+};
+
 struct PendingRequest {
   reshade::api::resource_view resource_view = {0u};
+  reshade::api::resource resource = {0u};
+  std::optional<std::vector<ScanTargetSpec>> batch_targets = std::nullopt;
+  std::optional<LutAnalysisSpec> lut_analysis = std::nullopt;
+  std::optional<AbCompareSpec> ab_compare = std::nullopt;
   std::optional<std::filesystem::path> output_path = std::nullopt;
   std::optional<std::filesystem::path> output_directory = std::nullopt;
   std::optional<std::string> name_prefix = std::nullopt;
@@ -71,12 +102,20 @@ struct ToolContext {
   std::function<std::uint32_t(const json& arguments)> resolve_device_index;
   std::function<bool(std::uint32_t device_index, const std::shared_ptr<PendingRequest>& request)> enqueue_request;
   std::function<void(std::uint32_t device_index, const std::shared_ptr<PendingRequest>& request)> cancel_request;
+  std::function<std::vector<ScanTargetSpec>(
+      std::uint32_t device_index,
+      const std::vector<std::uint32_t>& draw_indices,
+      bool include_output_chain)>
+      resolve_scan_targets;
 };
 
 struct ProcessingContext {
   std::function<std::string(std::uint64_t value)> format_handle;
   std::function<std::string(reshade::api::format format)> format_format;
   std::function<resource_view_summary::ResourceViewSummary(reshade::api::resource_view resource_view, reshade::api::device* device)> build_resource_view_summary;
+  std::function<bool(reshade::api::device* device)> suspend_live_shaders;
+  std::function<void(reshade::api::device* device)> restore_live_shaders;
+  std::function<void(std::uint32_t device_index, const std::shared_ptr<PendingRequest>& request)> requeue_request;
 };
 
 namespace internal {
@@ -161,8 +200,68 @@ inline void to_json(json& j, const RatioStats& value) {
 
 [[nodiscard]] inline AnalysisTarget ResolveAnalysisTarget(
     reshade::api::resource_view resource_view,
+    reshade::api::resource raw_resource,
     reshade::api::device* device,
     bool prefer_clone) {
+  if (resource_view.handle == 0u && raw_resource.handle != 0u) {
+    reshade::api::resource resolved_resource = {0u};
+    reshade::api::resource_desc resolved_resource_desc = {};
+    bool clone_enabled = false;
+    reshade::api::resource clone_resource = {0u};
+    reshade::api::resource_desc clone_resource_desc = {};
+    bool resource_destroyed = false;
+    reshade::api::device* resource_device = nullptr;
+    const auto found_resource_info = renodx::utils::resource::GetResourceInfo(raw_resource, [&](const renodx::utils::resource::ResourceInfo& info) {
+      resolved_resource = info.resource;
+      resolved_resource_desc = info.desc;
+      clone_enabled = info.clone_enabled;
+      clone_resource = info.clone;
+      clone_resource_desc = info.clone_desc;
+      resource_destroyed = info.destroyed;
+      resource_device = info.device;
+    });
+    if (!found_resource_info || resource_destroyed) {
+      throw std::runtime_error(std::format("resourceHandle {} is not currently tracked.", raw_resource.handle));
+    }
+    if (resource_device != device) {
+      throw std::runtime_error("resourceHandle does not belong to the selected device.");
+    }
+
+    reshade::api::resource_view_desc synthetic_view_desc = {};
+    synthetic_view_desc.type = (resolved_resource_desc.type == reshade::api::resource_type::texture_3d)
+                                   ? reshade::api::resource_view_type::texture_3d
+                                   : reshade::api::resource_view_type::texture_2d;
+    synthetic_view_desc.format = resolved_resource_desc.texture.format;
+    synthetic_view_desc.texture.first_level = 0u;
+    synthetic_view_desc.texture.level_count = 1u;
+    synthetic_view_desc.texture.first_layer = 0u;
+    synthetic_view_desc.texture.layer_count = 1u;
+
+    AnalysisTarget target = {
+        .requested_view = {0u},
+        .resolved_view = {0u},
+        .resolved_view_desc = synthetic_view_desc,
+        .resolved_resource = resolved_resource,
+        .resolved_resource_desc = resolved_resource_desc,
+        .used_clone = false,
+    };
+
+    if (prefer_clone) {
+      if (!clone_enabled) {
+        throw std::runtime_error("preferClone was requested, but clone hotswap is not enabled for the backing resource.");
+      }
+      if (clone_resource.handle == 0u) {
+        throw std::runtime_error("preferClone was requested, but the clone resource is not currently instantiated.");
+      }
+      target.resolved_resource = clone_resource;
+      target.resolved_resource_desc = clone_resource_desc;
+      target.resolved_view_desc.format = clone_resource_desc.texture.format;
+      target.used_clone = true;
+    }
+
+    return target;
+  }
+
   const auto resource_view_info = FindTrackedResourceViewInfo(resource_view);
   if (!resource_view_info.has_value() || resource_view_info->destroyed) {
     throw std::runtime_error(std::format("resourceViewHandle {} is not currently tracked.", resource_view.handle));
@@ -624,12 +723,138 @@ inline void EncodePreviewPixel(
   }
 }
 
+struct MappedTextureReadback {
+  reshade::api::device* device = nullptr;
+  reshade::api::resource staging = {0u};
+  bool used_buffer = false;
+  bool mapped = false;
+  reshade::api::subresource_data data = {};
+
+  MappedTextureReadback() = default;
+  MappedTextureReadback(const MappedTextureReadback&) = delete;
+  MappedTextureReadback& operator=(const MappedTextureReadback&) = delete;
+
+  ~MappedTextureReadback() {
+    Release();
+  }
+
+  void Release() {
+    if (device != nullptr && staging.handle != 0u) {
+      if (mapped) {
+        if (used_buffer) {
+          device->unmap_buffer_region(staging);
+        } else {
+          device->unmap_texture_region(staging, 0u);
+        }
+        mapped = false;
+      }
+      device->destroy_resource(staging);
+      staging = {0u};
+    }
+    data = {};
+    used_buffer = false;
+  }
+
+  [[nodiscard]] bool Acquire(
+      reshade::api::device* target_device,
+      reshade::api::command_queue* queue,
+      reshade::api::resource source,
+      uint32_t subresource,
+      bool is_3d,
+      uint32_t width,
+      uint32_t height,
+      uint32_t depth,
+      reshade::api::format intermediate_format,
+      std::string* out_error) {
+    Release();
+    device = target_device;
+
+    const bool created_texture = device->create_resource(
+        reshade::api::resource_desc(
+            is_3d ? reshade::api::resource_type::texture_3d : reshade::api::resource_type::texture_2d,
+            width,
+            height,
+            static_cast<uint16_t>(depth),
+            1u,
+            intermediate_format,
+            1u,
+            reshade::api::memory_heap::gpu_to_cpu,
+            reshade::api::resource_usage::copy_dest),
+        nullptr,
+        reshade::api::resource_usage::copy_dest,
+        &staging);
+
+    if (created_texture) {
+      used_buffer = false;
+      auto* cmd_list = queue->get_immediate_command_list();
+      cmd_list->copy_texture_region(source, subresource, nullptr, staging, 0u, nullptr);
+      queue->flush_immediate_command_list();
+      queue->wait_idle();
+
+      if (!device->map_texture_region(staging, 0u, nullptr, reshade::api::map_access::read_only, &data)) {
+        if (out_error != nullptr) *out_error = "Failed to map the texture readback staging resource.";
+        Release();
+        return false;
+      }
+      mapped = true;
+      return true;
+    }
+
+    // Fallback for APIs (e.g. Vulkan / D3D12) where gpu_to_cpu texture_3d staging resources are not supported:
+    const uint32_t bytes_per_pixel = reshade::api::format_row_pitch(intermediate_format, 1u);
+    const uint32_t raw_row_pitch = reshade::api::format_row_pitch(intermediate_format, width);
+    if (bytes_per_pixel == 0u || raw_row_pitch == 0u) {
+      if (out_error != nullptr) *out_error = "Unsupported texture format for buffer staging readback.";
+      return false;
+    }
+    const uint32_t aligned_row_pitch = (device->get_api() == reshade::api::device_api::d3d12)
+                                           ? ((raw_row_pitch + 255u) & ~255u)
+                                           : raw_row_pitch;
+    const uint32_t row_length_texels = aligned_row_pitch / bytes_per_pixel;
+    const uint32_t slice_pitch_bytes = aligned_row_pitch * height;
+    const uint64_t buffer_size = static_cast<uint64_t>(slice_pitch_bytes) * static_cast<uint64_t>(depth);
+
+    if (!device->create_resource(
+            reshade::api::resource_desc(
+                buffer_size,
+                reshade::api::memory_heap::gpu_to_cpu,
+                reshade::api::resource_usage::copy_dest),
+            nullptr,
+            reshade::api::resource_usage::copy_dest,
+            &staging)) {
+      if (out_error != nullptr) *out_error = "Failed to create a GPU-to-CPU staging texture or buffer for readback.";
+      return false;
+    }
+
+    used_buffer = true;
+    auto* cmd_list = queue->get_immediate_command_list();
+    cmd_list->copy_texture_to_buffer(source, subresource, nullptr, staging, 0u, row_length_texels, height);
+    queue->flush_immediate_command_list();
+    queue->wait_idle();
+
+    void* mapped_ptr = nullptr;
+    if (!device->map_buffer_region(staging, 0u, UINT64_MAX, reshade::api::map_access::read_only, &mapped_ptr)
+        || mapped_ptr == nullptr) {
+      if (out_error != nullptr) *out_error = "Failed to map the buffer readback staging resource.";
+      Release();
+      return false;
+    }
+
+    mapped = true;
+    data.data = mapped_ptr;
+    data.row_pitch = aligned_row_pitch;
+    data.slice_pitch = slice_pitch_bytes;
+    return true;
+  }
+};
+
 [[nodiscard]] inline ToolResult PerformResourceAnalysis(
     const ProcessingContext& context,
     std::uint32_t device_index,
     reshade::api::device* device,
     reshade::api::command_queue* queue,
     reshade::api::resource_view resource_view,
+    reshade::api::resource raw_resource,
     const std::optional<std::filesystem::path>& output_path,
     const std::optional<std::filesystem::path>& output_directory,
     const std::optional<std::string>& name_prefix,
@@ -638,11 +863,13 @@ inline void EncodePreviewPixel(
     bool prefer_clone) {
   AnalysisTarget target = {};
   try {
-    target = ResolveAnalysisTarget(resource_view, device, prefer_clone);
+    target = ResolveAnalysisTarget(resource_view, raw_resource, device, prefer_clone);
   } catch (const std::exception& exception) {
     auto error = std::string(exception.what());
     if (error.starts_with("resourceViewHandle ")) {
       error = std::format("resourceViewHandle {} is not currently tracked.", FormatHandle(context, resource_view.handle));
+    } else if (error.starts_with("resourceHandle ")) {
+      error = std::format("resourceHandle {} is not currently tracked.", FormatHandle(context, raw_resource.handle));
     }
     return ToolResult{
         .text = error,
@@ -651,11 +878,13 @@ inline void EncodePreviewPixel(
     };
   }
 
+  const bool is_3d = (target.resolved_resource_desc.type == reshade::api::resource_type::texture_3d);
   if (target.resolved_resource_desc.type != reshade::api::resource_type::texture_2d
-      && target.resolved_resource_desc.type != reshade::api::resource_type::surface) {
+      && target.resolved_resource_desc.type != reshade::api::resource_type::surface
+      && !is_3d) {
     return ToolResult{
-        .text = "Only 2D texture resource views are currently supported.",
-        .structured_content = json{{"error", "Only 2D texture resource views are currently supported."}},
+        .text = "Only 2D and 3D texture resources are currently supported.",
+        .structured_content = json{{"error", "Only 2D and 3D texture resources are currently supported."}},
         .is_error = true,
     };
   }
@@ -668,62 +897,62 @@ inline void EncodePreviewPixel(
   }
 
   const auto summary_view = target.used_clone ? target.resolved_view : resource_view;
-  const auto resource_view_summary_value = context.build_resource_view_summary
+  const auto resource_view_summary_value = (context.build_resource_view_summary && summary_view.handle != 0u)
                                                ? std::optional<resource_view_summary::ResourceViewSummary>(
                                                      context.build_resource_view_summary(summary_view, device))
                                                : std::nullopt;
   const auto upload_resource = [&]() {
-    if (const auto resource_from_view = renodx::utils::resource::GetResourceFromView(resource_view);
-        resource_from_view.handle != 0u) {
-      return resource_from_view;
+    if (resource_view.handle != 0u) {
+      if (const auto resource_from_view = renodx::utils::resource::GetResourceFromView(resource_view);
+          resource_from_view.handle != 0u) {
+        return resource_from_view;
+      }
     }
     return target.resolved_resource;
   }();
 
   const auto first_level = target.resolved_view_desc.texture.first_level;
-  const auto first_layer = target.resolved_view_desc.texture.first_layer;
+  const auto first_layer = is_3d ? 0u : target.resolved_view_desc.texture.first_layer;
   const auto levels = std::max<uint32_t>(target.resolved_resource_desc.texture.levels, 1u);
-  const auto subresource = first_level + (first_layer * levels);
+  const auto subresource = is_3d ? first_level : (first_level + (first_layer * levels));
   const auto width = std::max<uint32_t>(target.resolved_resource_desc.texture.width >> first_level, 1u);
   const auto height = std::max<uint32_t>(target.resolved_resource_desc.texture.height >> first_level, 1u);
+  const auto depth = is_3d
+                         ? std::max<uint32_t>(static_cast<uint32_t>(target.resolved_resource_desc.texture.depth_or_layers) >> first_level, 1u)
+                         : 1u;
+  const auto preview_width = width * depth;
   const auto intermediate_format = reshade::api::format_to_default_typed(target.resolved_resource_desc.texture.format, 0);
   const auto analysis_format = target.resolved_view_desc.format != reshade::api::format::unknown
                                    ? target.resolved_view_desc.format
                                    : intermediate_format;
 
-  reshade::api::resource intermediate = {0u};
-  if (!device->create_resource(
-          reshade::api::resource_desc(
-              width,
-              height,
-              1,
-              1,
-              intermediate_format,
-              1,
-              reshade::api::memory_heap::gpu_to_cpu,
-              reshade::api::resource_usage::copy_dest),
-          nullptr,
-          reshade::api::resource_usage::copy_dest,
-          &intermediate)) {
+  MappedTextureReadback readback;
+  std::string readback_error;
+  if (!readback.Acquire(
+          device,
+          queue,
+          target.resolved_resource,
+          subresource,
+          is_3d,
+          width,
+          height,
+          depth,
+          intermediate_format,
+          &readback_error)) {
     return ToolResult{
-        .text = "Failed to create a GPU-to-CPU readback resource.",
-        .structured_content = json{{"error", "Failed to create a GPU-to-CPU readback resource."}},
+        .text = readback_error,
+        .structured_content = json{{"error", readback_error}},
         .is_error = true,
     };
   }
-
-  auto* cmd_list = queue->get_immediate_command_list();
-  cmd_list->copy_texture_region(target.resolved_resource, subresource, nullptr, intermediate, 0, nullptr);
-  queue->flush_immediate_command_list();
-  queue->wait_idle();
 
   ToolResult tool_result = {
       .text = "Failed to map the readback resource.",
       .structured_content = json{{"error", "Failed to map the readback resource."}},
       .is_error = true,
   };
-  reshade::api::subresource_data mapped_data = {};
-  if (device->map_texture_region(intermediate, 0, nullptr, reshade::api::map_access::read_only, &mapped_data)) {
+  const auto& mapped_data = readback.data;
+  {
     double channel_min[4] = {
         std::numeric_limits<double>::infinity(),
         std::numeric_limits<double>::infinity(),
@@ -751,6 +980,16 @@ inline void EncodePreviewPixel(
     uint64_t pixels_any_above_one = 0u;
     uint64_t pixels_any_above_two = 0u;
     uint64_t pixels_any_above_four = 0u;
+    uint64_t gamut_bt709_pixels = 0u;
+    uint64_t gamut_dci_p3_pixels = 0u;
+    uint64_t gamut_bt2020_pixels = 0u;
+    uint64_t gamut_out_of_bt2020_pixels = 0u;
+    const uint64_t total_expected_pixels = static_cast<uint64_t>(width) * static_cast<uint64_t>(height) * static_cast<uint64_t>(depth);
+    const uint64_t percentile_sample_stride = std::max<uint64_t>(1u, total_expected_pixels / 65536u);
+    std::vector<float> luminance_samples;
+    std::vector<float> max_rgb_samples;
+    luminance_samples.reserve(static_cast<size_t>(std::min<uint64_t>(total_expected_pixels, 65536u) + 16u));
+    max_rgb_samples.reserve(static_cast<size_t>(std::min<uint64_t>(total_expected_pixels, 65536u) + 16u));
     bool supported_format = true;
     std::vector<std::uint8_t> preview_pixels;
     std::vector<std::uint8_t> raw_png_pixels;
@@ -782,38 +1021,42 @@ inline void EncodePreviewPixel(
       preferred_crc32_source = "latest_upload";
     }
     if (output_path.has_value() && output_format == OutputFormat::PNG) {
-      preview_pixels.resize(static_cast<size_t>(width) * static_cast<size_t>(height) * 4u);
+      preview_pixels.resize(static_cast<size_t>(preview_width) * static_cast<size_t>(height) * 4u);
     }
     if (output_path.has_value() && output_format == OutputFormat::EXR) {
-      if (analysis_format != reshade::api::format::r16g16b16a16_float) {
-        exr_pixels.resize(static_cast<size_t>(width) * static_cast<size_t>(height) * 4u);
+      if (is_3d || analysis_format != reshade::api::format::r16g16b16a16_float) {
+        exr_pixels.resize(static_cast<size_t>(preview_width) * static_cast<size_t>(height) * 4u);
       }
     }
 
-    for (uint32_t y = 0; y < height && supported_format; ++y) {
-      const auto* row = static_cast<const std::uint8_t*>(mapped_data.data) + (static_cast<size_t>(mapped_data.row_pitch) * y);
-      const auto pixel_stride = static_cast<size_t>(reshade::api::format_row_pitch(intermediate_format, 1));
-      for (uint32_t x = 0; x < width; ++x) {
-        float rgba[4] = {0.f, 0.f, 0.f, 1.f};
-        uint32_t decoded_channel_count = 4u;
-        const auto* pixel = row + (pixel_stride * x);
-        if (!DecodePixelToLinear(analysis_format, pixel, rgba, decoded_channel_count)) {
-          supported_format = false;
-          break;
-        }
-        if (!preview_pixels.empty()) {
-          EncodePreviewPixel(
-              rgba,
-              preview_mode,
-              preview_pixels.data() + ((static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x)) * 4u));
-        }
-        if (!exr_pixels.empty()) {
-          auto* out_pixel = exr_pixels.data() + ((static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x)) * 4u);
-          out_pixel[0] = rgba[0];
-          out_pixel[1] = rgba[1];
-          out_pixel[2] = rgba[2];
-          out_pixel[3] = rgba[3];
-        }
+    const auto slice_pitch = (mapped_data.slice_pitch != 0u)
+                                 ? static_cast<size_t>(mapped_data.slice_pitch)
+                                 : (static_cast<size_t>(mapped_data.row_pitch) * static_cast<size_t>(height));
+    const auto pixel_stride = static_cast<size_t>(reshade::api::format_row_pitch(intermediate_format, 1));
+    for (uint32_t z = 0; z < depth && supported_format; ++z) {
+      const auto* slice = static_cast<const std::uint8_t*>(mapped_data.data) + (slice_pitch * z);
+      for (uint32_t y = 0; y < height && supported_format; ++y) {
+        const auto* row = slice + (static_cast<size_t>(mapped_data.row_pitch) * y);
+        for (uint32_t x = 0; x < width; ++x) {
+          float rgba[4] = {0.f, 0.f, 0.f, 1.f};
+          uint32_t decoded_channel_count = 4u;
+          const auto* pixel = row + (pixel_stride * x);
+          if (!DecodePixelToLinear(analysis_format, pixel, rgba, decoded_channel_count)) {
+            supported_format = false;
+            break;
+          }
+          const auto preview_x = static_cast<size_t>(z) * static_cast<size_t>(width) + static_cast<size_t>(x);
+          const auto preview_offset = ((static_cast<size_t>(y) * static_cast<size_t>(preview_width)) + preview_x) * 4u;
+          if (!preview_pixels.empty()) {
+            EncodePreviewPixel(rgba, preview_mode, preview_pixels.data() + preview_offset);
+          }
+          if (!exr_pixels.empty()) {
+            auto* out_pixel = exr_pixels.data() + preview_offset;
+            out_pixel[0] = rgba[0];
+            out_pixel[1] = rgba[1];
+            out_pixel[2] = rgba[2];
+            out_pixel[3] = rgba[3];
+          }
         ++pixel_count;
         channel_count = decoded_channel_count;
 
@@ -853,11 +1096,38 @@ inline void EncodePreviewPixel(
         luminance_min = std::min(luminance_min, luminance);
         luminance_max = std::max(luminance_max, luminance);
         luminance_sum += luminance;
+
+        if (((finite_pixel_count - 1u) % percentile_sample_stride) == 0u) {
+          luminance_samples.push_back(static_cast<float>(luminance));
+          max_rgb_samples.push_back(std::max({rgba[0], rgba[1], rgba[2]}));
+        }
+
+        constexpr double GAMUT_EPS = -1e-4;
+        if (rgba[0] >= GAMUT_EPS && rgba[1] >= GAMUT_EPS && rgba[2] >= GAMUT_EPS) {
+          ++gamut_bt709_pixels;
+        } else {
+          const double p3_r = (0.82246197 * rgba[0]) + (0.17753803 * rgba[1]);
+          const double p3_g = (0.03319420 * rgba[0]) + (0.96680580 * rgba[1]);
+          const double p3_b = (0.01708263 * rgba[0]) + (0.07239744 * rgba[1]) + (0.91051993 * rgba[2]);
+          if (p3_r >= GAMUT_EPS && p3_g >= GAMUT_EPS && p3_b >= GAMUT_EPS) {
+            ++gamut_dci_p3_pixels;
+          } else {
+            const double bt2020_r = (0.62740390 * rgba[0]) + (0.32928304 * rgba[1]) + (0.04331307 * rgba[2]);
+            const double bt2020_g = (0.06909729 * rgba[0]) + (0.91954040 * rgba[1]) + (0.01136232 * rgba[2]);
+            const double bt2020_b = (0.01639144 * rgba[0]) + (0.08801331 * rgba[1]) + (0.89559525 * rgba[2]);
+            if (bt2020_r >= GAMUT_EPS && bt2020_g >= GAMUT_EPS && bt2020_b >= GAMUT_EPS) {
+              ++gamut_bt2020_pixels;
+            } else {
+              ++gamut_out_of_bt2020_pixels;
+            }
+          }
+        }
+      }
       }
     }
 
     if (!supported_format) {
-      device->unmap_texture_region(intermediate, 0);
+      readback.Release();
       const auto error = std::format("Readback is not implemented for format {}.", FormatFormat(context, analysis_format));
       tool_result = ToolResult{
           .text = error,
@@ -882,7 +1152,7 @@ inline void EncodePreviewPixel(
         } else {
           switch (output_format) {
             case OutputFormat::PNG:
-              if (!WritePngPreview(output_path.value(), width, height, preview_pixels)) {
+              if (!WritePngPreview(output_path.value(), preview_width, height, preview_pixels)) {
                 output_error = std::format(
                     "Failed to write preview PNG to '{}'.",
                     output_path->string());
@@ -891,14 +1161,14 @@ inline void EncodePreviewPixel(
                     {"path", output_path->string()},
                     {"format", "png"},
                     {"mode", preview_mode_name},
-                    {"width", width},
+                    {"width", preview_width},
                     {"height", height},
                 };
               }
               break;
             case OutputFormat::EXR:
               try {
-                if (analysis_format == reshade::api::format::r16g16b16a16_float) {
+                if (!is_3d && analysis_format == reshade::api::format::r16g16b16a16_float) {
                   if ((mapped_data.row_pitch % sizeof(std::uint16_t)) != 0u) {
                     output_error = std::format(
                         "Mapped RGBA16F readback row pitch ({}) is not aligned to 16-bit values.",
@@ -918,7 +1188,7 @@ inline void EncodePreviewPixel(
                 } else {
                   renodx::utils::exr::WriteRgba16f(
                       output_path.value(),
-                      width,
+                      preview_width,
                       height,
                       std::span<const float>(exr_pixels.data(), exr_pixels.size()));
                 }
@@ -928,7 +1198,7 @@ inline void EncodePreviewPixel(
                     {"layout", "scanline"},
                     {"compression", "none"},
                     {"pixelType", "rgba16f"},
-                    {"width", width},
+                    {"width", preview_width},
                     {"height", height},
                 };
               } catch (const std::exception& exception) {
@@ -998,7 +1268,7 @@ inline void EncodePreviewPixel(
         }
       }
 
-      device->unmap_texture_region(intermediate, 0);
+      readback.Release();
 
       if (output_error.has_value()) {
         tool_result = ToolResult{
@@ -1006,7 +1276,6 @@ inline void EncodePreviewPixel(
             .structured_content = json{{"error", output_error.value()}},
             .is_error = true,
         };
-        device->destroy_resource(intermediate);
         return tool_result;
       }
 
@@ -1040,9 +1309,23 @@ inline void EncodePreviewPixel(
                                          ? json(nullptr)
                                          : json(FormatFormat(context, target.resolved_resource_desc.texture.format))},
       };
+      const auto compute_percentile = [](std::vector<float>* samples, double fraction) -> json {
+        if (samples->empty()) return json(nullptr);
+        const auto target_index = std::min<size_t>(
+            samples->size() - 1u,
+            static_cast<size_t>(std::floor(fraction * static_cast<double>(samples->size() - 1u))));
+        std::nth_element(samples->begin(), samples->begin() + static_cast<std::ptrdiff_t>(target_index), samples->end());
+        return json(static_cast<double>((*samples)[target_index]));
+      };
+      const json luminance_p99 = compute_percentile(&luminance_samples, 0.99);
+      const json luminance_p999 = compute_percentile(&luminance_samples, 0.999);
+      const json max_rgb_p99 = compute_percentile(&max_rgb_samples, 0.99);
+      const json max_rgb_p999 = compute_percentile(&max_rgb_samples, 0.999);
+
       json result = {
           {"deviceIndex", device_index},
-          {"resourceViewHandle", FormatHandle(context, resource_view.handle)},
+          {"resourceViewHandle", resource_view.handle == 0u ? json(nullptr) : json(FormatHandle(context, resource_view.handle))},
+          {"resourceHandle", FormatHandle(context, target.resolved_resource.handle)},
           {"resourceView", resource_view_json},
           {"analysisTarget", analysis_target_json},
           {
@@ -1066,6 +1349,7 @@ inline void EncodePreviewPixel(
                   {"subresourceIndex", subresource},
                   {"width", width},
                   {"height", height},
+                  {"depth", depth},
                   {"analysisFormat", FormatFormat(context, analysis_format)},
                   {"intermediateFormat", FormatFormat(context, intermediate_format)},
                   {"channelCount", channel_count},
@@ -1089,6 +1373,26 @@ inline void EncodePreviewPixel(
                       },
                   },
                   {"luminance", ScalarStats(luminance_min, luminance_max, luminance_sum, finite_pixel_count)},
+                  {
+                      "percentiles",
+                      {
+                          {"luminanceP99", luminance_p99},
+                          {"luminanceP999", luminance_p999},
+                          {"maxRgbP99", max_rgb_p99},
+                          {"maxRgbP999", max_rgb_p999},
+                          {"sampleCount", luminance_samples.size()},
+                      },
+                  },
+                  {
+                      "gamut",
+                      {
+                          {"assumedColorSpace", "bt709_linear"},
+                          {"bt709", RatioStats(gamut_bt709_pixels, finite_pixel_count)},
+                          {"dciP3Only", RatioStats(gamut_dci_p3_pixels, finite_pixel_count)},
+                          {"bt2020Only", RatioStats(gamut_bt2020_pixels, finite_pixel_count)},
+                          {"outOfBt2020", RatioStats(gamut_out_of_bt2020_pixels, finite_pixel_count)},
+                      },
+                  },
               },
           },
       };
@@ -1165,8 +1469,773 @@ inline void EncodePreviewPixel(
     }
   }
 
-  device->destroy_resource(intermediate);
+  readback.Release();
   return tool_result;
+}
+
+[[nodiscard]] inline ToolResult PerformBatchPassScan(
+    const ProcessingContext& context,
+    std::uint32_t device_index,
+    reshade::api::device* device,
+    reshade::api::command_queue* queue,
+    const std::vector<ScanTargetSpec>& targets,
+    bool prefer_clone) {
+  json entries = json::array();
+  std::size_t ok_count = 0u;
+  std::size_t error_count = 0u;
+  std::optional<std::size_t> last_hdr_entry_index = std::nullopt;
+  std::optional<std::size_t> first_clipped_after_hdr_index = std::nullopt;
+  std::optional<std::size_t> last_negative_entry_index = std::nullopt;
+  std::optional<std::size_t> first_nan_or_inf_entry_index = std::nullopt;
+
+  for (std::size_t index = 0u; index < targets.size(); ++index) {
+    const auto& spec = targets[index];
+    const auto single_result = PerformResourceAnalysis(
+        context,
+        device_index,
+        device,
+        queue,
+        spec.resource_view,
+        spec.resource,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        PreviewMode::CLAMPED,
+        "clamped",
+        prefer_clone);
+
+    json entry = {
+        {"scanIndex", index},
+        {"label", spec.label},
+        {"drawIndex", spec.draw_index.has_value() ? json(spec.draw_index.value()) : json(nullptr)},
+        {"shaderHashes", spec.shader_hashes},
+        {"resourceViewHandle", spec.resource_view.handle == 0u ? json(nullptr) : json(FormatHandle(context, spec.resource_view.handle))},
+        {"resourceHandle", spec.resource.handle == 0u ? json(nullptr) : json(FormatHandle(context, spec.resource.handle))},
+        {"ok", !single_result.is_error},
+    };
+
+    if (single_result.is_error) {
+      ++error_count;
+      entry["error"] = single_result.text;
+    } else {
+      ++ok_count;
+      const auto& sc = single_result.structured_content;
+      if (sc.contains("resourceHandle")) {
+        entry["resourceHandle"] = sc["resourceHandle"];
+      }
+      if (sc.contains("analysis")) {
+        const auto& analysis = sc["analysis"];
+        entry["width"] = analysis["width"];
+        entry["height"] = analysis["height"];
+        entry["format"] = analysis["analysisFormat"];
+        entry["channels"] = analysis["channels"];
+        entry["luminance"] = analysis["luminance"];
+        entry["percentiles"] = analysis["percentiles"];
+        entry["gamut"] = analysis["gamut"];
+        entry["pixelsAnyAbove1"] = analysis["pixelsAnyChannelAbove1"];
+        entry["pixelsAnyNegative"] = analysis["pixelsAnyNegative"];
+        entry["nanPixels"] = analysis["nanPixels"];
+        entry["infPixels"] = analysis["infPixels"];
+
+        const auto above_one_count = analysis["pixelsAnyChannelAbove1"]["count"].get<std::uint64_t>();
+        const auto negative_count = analysis["pixelsAnyNegative"]["count"].get<std::uint64_t>();
+        const auto nan_count = analysis["nanPixels"]["count"].get<std::uint64_t>();
+        const auto inf_count = analysis["infPixels"]["count"].get<std::uint64_t>();
+        if (above_one_count > 0u) {
+          last_hdr_entry_index = index;
+          first_clipped_after_hdr_index = std::nullopt;
+        } else if (last_hdr_entry_index.has_value() && !first_clipped_after_hdr_index.has_value()) {
+          first_clipped_after_hdr_index = index;
+        }
+        if (negative_count > 0u) {
+          last_negative_entry_index = index;
+        }
+        if ((nan_count > 0u || inf_count > 0u) && !first_nan_or_inf_entry_index.has_value()) {
+          first_nan_or_inf_entry_index = index;
+        }
+      }
+    }
+
+    entries.push_back(std::move(entry));
+  }
+
+  const auto make_summary_ref = [&](const std::optional<std::size_t>& entry_index) -> json {
+    if (!entry_index.has_value()) return json(nullptr);
+    const auto& spec = targets[entry_index.value()];
+    return json{
+        {"scanIndex", entry_index.value()},
+        {"label", spec.label},
+        {"drawIndex", spec.draw_index.has_value() ? json(spec.draw_index.value()) : json(nullptr)},
+        {"shaderHashes", spec.shader_hashes},
+    };
+  };
+
+  json result = {
+      {"deviceIndex", device_index},
+      {"scannedCount", targets.size()},
+      {"okCount", ok_count},
+      {"errorCount", error_count},
+      {"hdrDropOff", {
+                         {"lastPassWithValuesAbove1", make_summary_ref(last_hdr_entry_index)},
+                         {"firstClippedPassAfterHdr", make_summary_ref(first_clipped_after_hdr_index)},
+                         {"lastPassWithNegativeValues", make_summary_ref(last_negative_entry_index)},
+                         {"firstPassWithNanOrInf", make_summary_ref(first_nan_or_inf_entry_index)},
+                     }},
+      {"results", entries},
+  };
+
+  auto text = std::format(
+      "Scanned {} resource(s) on device #{} ({} succeeded, {} failed).",
+      targets.size(),
+      device_index,
+      ok_count,
+      error_count);
+  return ToolResult{
+      .text = text,
+      .structured_content = result,
+  };
+}
+
+[[nodiscard]] inline std::pair<double, double> ComputeHueDegAndSat(double r, double g, double b) {
+  const double c_max = std::max({r, g, b});
+  const double c_min = std::min({r, g, b});
+  const double delta = c_max - c_min;
+  double hue = 0.0;
+  if (delta > 1e-6) {
+    if (c_max == r) {
+      hue = 60.0 * std::fmod(((g - b) / delta), 6.0);
+    } else if (c_max == g) {
+      hue = 60.0 * (((b - r) / delta) + 2.0);
+    } else {
+      hue = 60.0 * (((r - g) / delta) + 4.0);
+    }
+    if (hue < 0.0) {
+      hue += 360.0;
+    }
+  }
+  const double sat = (c_max > 1e-6) ? (delta / c_max) : 0.0;
+  return {hue, sat};
+}
+
+[[nodiscard]] inline double SignedHueDeltaDeg(double measured_deg, double reference_deg) {
+  double diff = std::fmod((measured_deg - reference_deg) + 540.0, 360.0) - 180.0;
+  if (diff < -180.0) diff += 360.0;
+  return diff;
+}
+
+[[nodiscard]] inline ToolResult PerformLutAnalysis(
+    const ProcessingContext& context,
+    std::uint32_t device_index,
+    reshade::api::device* device,
+    reshade::api::command_queue* queue,
+    reshade::api::resource_view resource_view,
+    reshade::api::resource raw_resource,
+    const LutAnalysisSpec& spec,
+    bool prefer_clone) {
+  AnalysisTarget target = {};
+  try {
+    target = ResolveAnalysisTarget(resource_view, raw_resource, device, prefer_clone);
+  } catch (const std::exception& exception) {
+    auto error = std::string(exception.what());
+    if (error.starts_with("resourceViewHandle ")) {
+      error = std::format("resourceViewHandle {} is not currently tracked.", FormatHandle(context, resource_view.handle));
+    } else if (error.starts_with("resourceHandle ")) {
+      error = std::format("resourceHandle {} is not currently tracked.", FormatHandle(context, raw_resource.handle));
+    }
+    return ToolResult{
+        .text = error,
+        .structured_content = json{{"error", error}},
+        .is_error = true,
+    };
+  }
+
+  const bool is_3d = (target.resolved_resource_desc.type == reshade::api::resource_type::texture_3d);
+  if (target.resolved_resource_desc.type != reshade::api::resource_type::texture_2d
+      && target.resolved_resource_desc.type != reshade::api::resource_type::surface
+      && !is_3d) {
+    return ToolResult{
+        .text = "devkit_analyze_lut only supports 3D textures (texture_3d) and 2D strip LUT textures.",
+        .structured_content = json{{"error", "devkit_analyze_lut only supports 3D textures (texture_3d) and 2D strip LUT textures."}},
+        .is_error = true,
+    };
+  }
+  if (target.resolved_resource_desc.texture.samples != 1u) {
+    return ToolResult{
+        .text = "Multisampled textures are not supported for LUT analysis.",
+        .structured_content = json{{"error", "Multisampled textures are not supported for LUT analysis."}},
+        .is_error = true,
+    };
+  }
+
+  const auto first_level = target.resolved_view_desc.texture.first_level;
+  const auto first_layer = is_3d ? 0u : target.resolved_view_desc.texture.first_layer;
+  const auto levels = std::max<uint32_t>(target.resolved_resource_desc.texture.levels, 1u);
+  const auto subresource = is_3d ? first_level : (first_level + (first_layer * levels));
+  const auto width = std::max<uint32_t>(target.resolved_resource_desc.texture.width >> first_level, 1u);
+  const auto height = std::max<uint32_t>(target.resolved_resource_desc.texture.height >> first_level, 1u);
+  const auto depth = is_3d
+                         ? std::max<uint32_t>(static_cast<uint32_t>(target.resolved_resource_desc.texture.depth_or_layers) >> first_level, 1u)
+                         : 1u;
+  const auto intermediate_format = reshade::api::format_to_default_typed(target.resolved_resource_desc.texture.format, 0);
+  const auto analysis_format = target.resolved_view_desc.format != reshade::api::format::unknown
+                                   ? target.resolved_view_desc.format
+                                   : intermediate_format;
+
+  std::string resolved_layout = spec.layout;
+  uint32_t nx = 0u;
+  uint32_t ny = 0u;
+  uint32_t nz = 0u;
+
+  if (resolved_layout == "auto") {
+    if (is_3d) {
+      resolved_layout = "texture_3d";
+    } else if (height >= 2u && height <= 128u && width == height * height) {
+      resolved_layout = "strip_2d_horizontal";
+    } else if (width >= 2u && width <= 128u && height == width * width) {
+      resolved_layout = "strip_2d_vertical";
+    } else if (spec.lut_size.has_value()) {
+      const auto n = spec.lut_size.value();
+      if (width == n * n && height == n) {
+        resolved_layout = "strip_2d_horizontal";
+      } else if (height == n * n && width == n) {
+        resolved_layout = "strip_2d_vertical";
+      }
+    }
+  }
+
+  if (resolved_layout == "texture_3d") {
+    if (!is_3d) {
+      return ToolResult{
+          .text = "layout='texture_3d' requires a texture_3d resource.",
+          .structured_content = json{{"error", "layout='texture_3d' requires a texture_3d resource."}},
+          .is_error = true,
+      };
+    }
+    nx = width;
+    ny = height;
+    nz = depth;
+  } else if (resolved_layout == "strip_2d_horizontal") {
+    const auto n = spec.lut_size.value_or(height);
+    if (n < 2u || width != n * n || height != n) {
+      const auto error = std::format(
+          "Resource dimensions {}x{} do not match a horizontal 2D LUT strip of size {} ({}x{}).",
+          width,
+          height,
+          n,
+          n * n,
+          n);
+      return ToolResult{
+          .text = error,
+          .structured_content = json{{"error", error}},
+          .is_error = true,
+      };
+    }
+    nx = n;
+    ny = n;
+    nz = n;
+  } else if (resolved_layout == "strip_2d_vertical") {
+    const auto n = spec.lut_size.value_or(width);
+    if (n < 2u || height != n * n || width != n) {
+      const auto error = std::format(
+          "Resource dimensions {}x{} do not match a vertical 2D LUT strip of size {} ({}x{}).",
+          width,
+          height,
+          n,
+          n,
+          n * n);
+      return ToolResult{
+          .text = error,
+          .structured_content = json{{"error", error}},
+          .is_error = true,
+      };
+    }
+    nx = n;
+    ny = n;
+    nz = n;
+  } else {
+    const auto error = std::format(
+        "Could not auto-detect LUT layout for {}x{}x{} texture. Specify layout ('texture_3d', 'strip_2d_horizontal', 'strip_2d_vertical') and lutSize.",
+        width,
+        height,
+        depth);
+    return ToolResult{
+        .text = error,
+        .structured_content = json{{"error", error}},
+        .is_error = true,
+    };
+  }
+
+  const uint64_t voxel_count = static_cast<uint64_t>(nx) * static_cast<uint64_t>(ny) * static_cast<uint64_t>(nz);
+  if (voxel_count == 0u || voxel_count > (128ull * 128ull * 128ull)) {
+    const auto error = std::format("LUT volume {}x{}x{} exceeds the 128^3 analysis limit.", nx, ny, nz);
+    return ToolResult{
+        .text = error,
+        .structured_content = json{{"error", error}},
+        .is_error = true,
+    };
+  }
+
+  MappedTextureReadback readback;
+  std::string readback_error;
+  if (!readback.Acquire(
+          device,
+          queue,
+          target.resolved_resource,
+          subresource,
+          is_3d,
+          width,
+          height,
+          depth,
+          intermediate_format,
+          &readback_error)) {
+    return ToolResult{
+        .text = readback_error,
+        .structured_content = json{{"error", readback_error}},
+        .is_error = true,
+    };
+  }
+  const auto& mapped_data = readback.data;
+
+  std::vector<std::array<float, 3>> cube(static_cast<size_t>(voxel_count), {0.f, 0.f, 0.f});
+  const auto slice_pitch = (mapped_data.slice_pitch != 0u)
+                               ? static_cast<size_t>(mapped_data.slice_pitch)
+                               : (static_cast<size_t>(mapped_data.row_pitch) * static_cast<size_t>(height));
+  const auto pixel_stride = static_cast<size_t>(reshade::api::format_row_pitch(intermediate_format, 1));
+  bool supported_format = true;
+
+  for (uint32_t b = 0u; b < nz && supported_format; ++b) {
+    for (uint32_t g = 0u; g < ny && supported_format; ++g) {
+      for (uint32_t r = 0u; r < nx; ++r) {
+        uint32_t src_x = 0u;
+        uint32_t src_y = 0u;
+        uint32_t src_z = 0u;
+        if (resolved_layout == "texture_3d") {
+          src_x = r;
+          src_y = g;
+          src_z = b;
+        } else if (resolved_layout == "strip_2d_horizontal") {
+          src_x = (b * nx) + r;
+          src_y = g;
+          src_z = 0u;
+        } else {
+          src_x = r;
+          src_y = (b * ny) + g;
+          src_z = 0u;
+        }
+
+        const auto* slice = static_cast<const std::uint8_t*>(mapped_data.data) + (slice_pitch * src_z);
+        const auto* row = slice + (static_cast<size_t>(mapped_data.row_pitch) * src_y);
+        const auto* pixel = row + (pixel_stride * src_x);
+        float rgba[4] = {0.f, 0.f, 0.f, 1.f};
+        uint32_t decoded_channels = 4u;
+        if (!DecodePixelToLinear(analysis_format, pixel, rgba, decoded_channels)) {
+          supported_format = false;
+          break;
+        }
+
+        const auto cube_index = ((static_cast<size_t>(b) * static_cast<size_t>(ny)) + static_cast<size_t>(g)) * static_cast<size_t>(nx)
+                                + static_cast<size_t>(r);
+        cube[cube_index] = {rgba[0], rgba[1], rgba[2]};
+      }
+    }
+  }
+
+  readback.Release();
+
+  if (!supported_format) {
+    const auto error = std::format("LUT readback is not implemented for format {}.", FormatFormat(context, analysis_format));
+    return ToolResult{
+        .text = error,
+        .structured_content = json{{"error", error}},
+        .is_error = true,
+    };
+  }
+
+  const auto sample_voxel = [&](uint32_t r, uint32_t g, uint32_t b) -> const std::array<float, 3>& {
+    return cube[((static_cast<size_t>(b) * static_cast<size_t>(ny)) + static_cast<size_t>(g)) * static_cast<size_t>(nx) + static_cast<size_t>(r)];
+  };
+
+  double ch_min[3] = {
+      std::numeric_limits<double>::infinity(),
+      std::numeric_limits<double>::infinity(),
+      std::numeric_limits<double>::infinity(),
+  };
+  double ch_max[3] = {
+      -std::numeric_limits<double>::infinity(),
+      -std::numeric_limits<double>::infinity(),
+      -std::numeric_limits<double>::infinity(),
+  };
+  double ch_sum[3] = {0.0, 0.0, 0.0};
+  uint64_t finite_count = 0u;
+  uint64_t nan_count = 0u;
+  uint64_t inf_count = 0u;
+  uint64_t above_one_count = 0u;
+  uint64_t below_zero_count = 0u;
+  double identity_max_delta = 0.0;
+  double identity_sum_delta = 0.0;
+
+  for (uint32_t b = 0u; b < nz; ++b) {
+    const double ib = (nz > 1u) ? (static_cast<double>(b) / static_cast<double>(nz - 1u)) : 0.0;
+    for (uint32_t g = 0u; g < ny; ++g) {
+      const double ig = (ny > 1u) ? (static_cast<double>(g) / static_cast<double>(ny - 1u)) : 0.0;
+      for (uint32_t r = 0u; r < nx; ++r) {
+        const double ir = (nx > 1u) ? (static_cast<double>(r) / static_cast<double>(nx - 1u)) : 0.0;
+        const auto& rgb = sample_voxel(r, g, b);
+        const bool has_nan = std::isnan(rgb[0]) || std::isnan(rgb[1]) || std::isnan(rgb[2]);
+        const bool has_inf = std::isinf(rgb[0]) || std::isinf(rgb[1]) || std::isinf(rgb[2]);
+        if (has_nan) ++nan_count;
+        if (has_inf) ++inf_count;
+        if (has_nan || has_inf) continue;
+
+        ++finite_count;
+        if (rgb[0] > 1.0001f || rgb[1] > 1.0001f || rgb[2] > 1.0001f) ++above_one_count;
+        if (rgb[0] < -0.0001f || rgb[1] < -0.0001f || rgb[2] < -0.0001f) ++below_zero_count;
+
+        for (int c = 0; c < 3; ++c) {
+          ch_min[c] = std::min(ch_min[c], static_cast<double>(rgb[c]));
+          ch_max[c] = std::max(ch_max[c], static_cast<double>(rgb[c]));
+          ch_sum[c] += static_cast<double>(rgb[c]);
+        }
+
+        const double dr = std::abs(static_cast<double>(rgb[0]) - ir);
+        const double dg = std::abs(static_cast<double>(rgb[1]) - ig);
+        const double db = std::abs(static_cast<double>(rgb[2]) - ib);
+        const double max_d = std::max({dr, dg, db});
+        identity_max_delta = std::max(identity_max_delta, max_d);
+        identity_sum_delta += (dr + dg + db) / 3.0;
+      }
+    }
+  }
+
+  const double global_min = finite_count > 0u ? std::min({ch_min[0], ch_min[1], ch_min[2]}) : 0.0;
+  const double global_max = finite_count > 0u ? std::max({ch_max[0], ch_max[1], ch_max[2]}) : 0.0;
+  const double identity_mean_delta = finite_count > 0u ? (identity_sum_delta / static_cast<double>(finite_count)) : 0.0;
+
+  // Neutral axis (R = G = B)
+  const uint32_t diag_steps = std::min({nx, ny, nz});
+  struct NeutralSample {
+    double input = 0.0;
+    double r = 0.0;
+    double g = 0.0;
+    double b = 0.0;
+    double lum = 0.0;
+  };
+  std::vector<NeutralSample> neutral_samples;
+  neutral_samples.reserve(diag_steps);
+  json neutral_axis_json = json::array();
+  bool neutral_monotonic = true;
+  double err_identity = 0.0;
+  double err_lin_to_srgb = 0.0;
+  double err_srgb_to_lin = 0.0;
+
+  for (uint32_t i = 0u; i < diag_steps; ++i) {
+    const double t = (diag_steps > 1u) ? (static_cast<double>(i) / static_cast<double>(diag_steps - 1u)) : 0.0;
+    const auto rx = static_cast<uint32_t>(std::llround(t * static_cast<double>(nx - 1u)));
+    const auto gy = static_cast<uint32_t>(std::llround(t * static_cast<double>(ny - 1u)));
+    const auto bz = static_cast<uint32_t>(std::llround(t * static_cast<double>(nz - 1u)));
+    const auto& rgb = sample_voxel(rx, gy, bz);
+    const double lum = (0.2126 * rgb[0]) + (0.7152 * rgb[1]) + (0.0722 * rgb[2]);
+    const double chroma_err = static_cast<double>(std::max({rgb[0], rgb[1], rgb[2]}) - std::min({rgb[0], rgb[1], rgb[2]}));
+
+    if (!neutral_samples.empty() && lum < neutral_samples.back().lum - 1e-4) {
+      neutral_monotonic = false;
+    }
+
+    neutral_samples.push_back(NeutralSample{
+        .input = t,
+        .r = rgb[0],
+        .g = rgb[1],
+        .b = rgb[2],
+        .lum = lum,
+    });
+
+    err_identity += std::abs(lum - t);
+    err_lin_to_srgb += std::abs(lum - std::pow(std::max(t, 0.0), 1.0 / 2.2));
+    err_srgb_to_lin += std::abs(lum - std::pow(std::max(t, 0.0), 2.2));
+
+    json eff_gamma = nullptr;
+    if (t > 0.02 && t < 0.98 && lum > 1e-4) {
+      eff_gamma = std::log(lum) / std::log(t);
+    }
+
+    neutral_axis_json.push_back(json{
+        {"index", i},
+        {"input", t},
+        {"r", static_cast<double>(rgb[0])},
+        {"g", static_cast<double>(rgb[1])},
+        {"b", static_cast<double>(rgb[2])},
+        {"luminance", lum},
+        {"chromaError", chroma_err},
+        {"effectiveGamma", eff_gamma},
+    });
+  }
+
+  const auto interp_neutral_lum = [&](double x) -> double {
+    if (neutral_samples.empty()) return 0.0;
+    if (x <= 0.0) return neutral_samples.front().lum;
+    if (x >= 1.0) return neutral_samples.back().lum;
+    const double pos = x * static_cast<double>(neutral_samples.size() - 1u);
+    const auto i0 = static_cast<size_t>(std::floor(pos));
+    const auto i1 = std::min(i0 + 1u, neutral_samples.size() - 1u);
+    const double frac = pos - static_cast<double>(i0);
+    return neutral_samples[i0].lum + (frac * (neutral_samples[i1].lum - neutral_samples[i0].lum));
+  };
+
+  const double lum_018 = interp_neutral_lum(0.18);
+  const double lum_025 = interp_neutral_lum(0.25);
+  const double lum_050 = interp_neutral_lum(0.50);
+  const double lum_075 = interp_neutral_lum(0.75);
+  const double lum_100 = interp_neutral_lum(1.00);
+  const double midtone_slope = (lum_050 - lum_025) / 0.25;
+  const double shoulder_slope = (lum_100 - lum_075) / 0.25;
+
+  std::string baked_tonemap_assessment = "linear_or_mild_grade";
+  if (global_max > 1.05) {
+    baked_tonemap_assessment = "hdr_extended_output";
+  } else if (identity_max_delta < 0.005) {
+    baked_tonemap_assessment = "identity_or_noop";
+  } else if (midtone_slope > 0.1 && (shoulder_slope / midtone_slope) < 0.45 && lum_100 <= 1.02) {
+    baked_tonemap_assessment = "likely_baked_tonemap";
+  } else if (midtone_slope > 1.15 && shoulder_slope < 0.85) {
+    baked_tonemap_assessment = "contrast_s_curve";
+  }
+
+  const double norm_steps = std::max<double>(static_cast<double>(diag_steps), 1.0);
+  const double mae_identity = err_identity / norm_steps;
+  const double mae_lin_to_srgb = err_lin_to_srgb / norm_steps;
+  const double mae_srgb_to_lin = err_srgb_to_lin / norm_steps;
+
+  std::string estimated_input_space = "encoded_sdr_srgb_or_gamma22";
+  if (global_max > 1.05) {
+    estimated_input_space = "hdr_linear_or_extended";
+  } else if (mae_lin_to_srgb < mae_identity * 0.7 && mae_lin_to_srgb < 0.12) {
+    estimated_input_space = "linear_to_encoded_gamma";
+  } else if (mae_srgb_to_lin < mae_identity * 0.7 && mae_srgb_to_lin < 0.12) {
+    estimated_input_space = "encoded_to_linear";
+  } else if (lum_018 > 0.34 && lum_050 > 0.65 && lum_100 <= 1.05) {
+    estimated_input_space = "log_or_hdr_shaper_to_sdr";
+  } else if (identity_max_delta < 0.005) {
+    estimated_input_space = "identity_space_preserving";
+  }
+
+  const auto make_corner_json = [&](const char* name, uint32_t r, uint32_t g, uint32_t b, std::optional<double> ref_hue_deg) {
+    const auto& rgb = sample_voxel(r, g, b);
+    json entry = {
+        {"name", name},
+        {"r", static_cast<double>(rgb[0])},
+        {"g", static_cast<double>(rgb[1])},
+        {"b", static_cast<double>(rgb[2])},
+        {"luminance", (0.2126 * rgb[0]) + (0.7152 * rgb[1]) + (0.0722 * rgb[2])},
+    };
+    if (ref_hue_deg.has_value()) {
+      const auto [hue_deg, sat] = ComputeHueDegAndSat(rgb[0], rgb[1], rgb[2]);
+      entry["hueDeg"] = hue_deg;
+      entry["hueShiftDeg"] = SignedHueDeltaDeg(hue_deg, ref_hue_deg.value());
+      entry["saturation"] = sat;
+    }
+    return entry;
+  };
+
+  json corners_json = {
+      {"black", make_corner_json("black", 0u, 0u, 0u, std::nullopt)},
+      {"white", make_corner_json("white", nx - 1u, ny - 1u, nz - 1u, std::nullopt)},
+      {"red", make_corner_json("red", nx - 1u, 0u, 0u, 0.0)},
+      {"yellow", make_corner_json("yellow", nx - 1u, ny - 1u, 0u, 60.0)},
+      {"green", make_corner_json("green", 0u, ny - 1u, 0u, 120.0)},
+      {"cyan", make_corner_json("cyan", 0u, ny - 1u, nz - 1u, 180.0)},
+      {"blue", make_corner_json("blue", 0u, 0u, nz - 1u, 240.0)},
+      {"magenta", make_corner_json("magenta", nx - 1u, 0u, nz - 1u, 300.0)},
+  };
+
+  const auto& black_rgb = sample_voxel(0u, 0u, 0u);
+  const auto& white_rgb = sample_voxel(nx - 1u, ny - 1u, nz - 1u);
+  const double black_lift = static_cast<double>(std::max({black_rgb[0], black_rgb[1], black_rgb[2]}));
+  const double white_lum = (0.2126 * white_rgb[0]) + (0.7152 * white_rgb[1]) + (0.0722 * white_rgb[2]);
+  const bool is_cubic = (nx == ny && ny == nz);
+
+  json exports_json = json::object();
+  if (spec.export_cube_path.has_value()) {
+    if (!is_cubic) {
+      return ToolResult{
+          .text = std::format("Cannot export non-cubic LUT ({}x{}x{}) to .cube format.", nx, ny, nz),
+          .structured_content = json{{"error", std::format("Cannot export non-cubic LUT ({}x{}x{}) to .cube format.", nx, ny, nz)}},
+          .is_error = true,
+      };
+    }
+    std::error_code dir_error;
+    if (!spec.export_cube_path->parent_path().empty()) {
+      std::filesystem::create_directories(spec.export_cube_path->parent_path(), dir_error);
+    }
+    std::ofstream cube_out(spec.export_cube_path.value(), std::ios::out | std::ios::trunc);
+    if (!cube_out.is_open()) {
+      const auto error = std::format("Failed to open '{}' for .cube export.", spec.export_cube_path->string());
+      return ToolResult{
+          .text = error,
+          .structured_content = json{{"error", error}},
+          .is_error = true,
+      };
+    }
+    cube_out << "TITLE \"RenoDX DevKit LUT " << FormatHandle(context, target.resolved_resource.handle) << "\"\n";
+    cube_out << "LUT_3D_SIZE " << nx << "\n";
+    cube_out << "DOMAIN_MIN 0.0 0.0 0.0\n";
+    cube_out << "DOMAIN_MAX 1.0 1.0 1.0\n";
+    cube_out << std::fixed << std::setprecision(6);
+    for (const auto& rgb : cube) {
+      const float r_val = std::isfinite(rgb[0]) ? rgb[0] : 0.f;
+      const float g_val = std::isfinite(rgb[1]) ? rgb[1] : 0.f;
+      const float b_val = std::isfinite(rgb[2]) ? rgb[2] : 0.f;
+      cube_out << r_val << ' ' << g_val << ' ' << b_val << '\n';
+    }
+    cube_out.flush();
+    exports_json["cube"] = {
+        {"path", spec.export_cube_path->string()},
+        {"lutSize", nx},
+        {"entryCount", cube.size()},
+    };
+  }
+
+  if (spec.export_preview_path.has_value()) {
+    std::error_code dir_error;
+    if (!spec.export_preview_path->parent_path().empty()) {
+      std::filesystem::create_directories(spec.export_preview_path->parent_path(), dir_error);
+    }
+    const auto preview_fmt = GetOutputFormat(spec.export_preview_path.value());
+    const uint32_t strip_w = nx * nz;
+    const uint32_t strip_h = ny;
+    if (preview_fmt == OutputFormat::EXR) {
+      std::vector<float> exr_strip(static_cast<size_t>(strip_w) * static_cast<size_t>(strip_h) * 4u, 1.f);
+      for (uint32_t b = 0u; b < nz; ++b) {
+        for (uint32_t g = 0u; g < ny; ++g) {
+          for (uint32_t r = 0u; r < nx; ++r) {
+            const auto& rgb = sample_voxel(r, g, b);
+            const auto sx = (b * nx) + r;
+            const auto offset = ((static_cast<size_t>(g) * static_cast<size_t>(strip_w)) + static_cast<size_t>(sx)) * 4u;
+            exr_strip[offset + 0u] = rgb[0];
+            exr_strip[offset + 1u] = rgb[1];
+            exr_strip[offset + 2u] = rgb[2];
+            exr_strip[offset + 3u] = 1.f;
+          }
+        }
+      }
+      renodx::utils::exr::WriteRgba16f(
+          spec.export_preview_path.value(),
+          strip_w,
+          strip_h,
+          std::span<const float>(exr_strip.data(), exr_strip.size()));
+      exports_json["preview"] = {{"path", spec.export_preview_path->string()}, {"format", "exr"}, {"width", strip_w}, {"height", strip_h}};
+    } else {
+      std::vector<std::uint8_t> png_strip(static_cast<size_t>(strip_w) * static_cast<size_t>(strip_h) * 4u, 255u);
+      for (uint32_t b = 0u; b < nz; ++b) {
+        for (uint32_t g = 0u; g < ny; ++g) {
+          for (uint32_t r = 0u; r < nx; ++r) {
+            const auto& rgb = sample_voxel(r, g, b);
+            const float rgba[4] = {rgb[0], rgb[1], rgb[2], 1.f};
+            const auto sx = (b * nx) + r;
+            const auto offset = ((static_cast<size_t>(g) * static_cast<size_t>(strip_w)) + static_cast<size_t>(sx)) * 4u;
+            EncodePreviewPixel(rgba, PreviewMode::CLAMPED, png_strip.data() + offset);
+          }
+        }
+      }
+      if (!WritePngPreview(spec.export_preview_path.value(), strip_w, strip_h, png_strip)) {
+        const auto error = std::format("Failed to write LUT preview PNG to '{}'.", spec.export_preview_path->string());
+        return ToolResult{
+            .text = error,
+            .structured_content = json{{"error", error}},
+            .is_error = true,
+        };
+      }
+      exports_json["preview"] = {{"path", spec.export_preview_path->string()}, {"format", "png"}, {"width", strip_w}, {"height", strip_h}};
+    }
+  }
+
+  json result = {
+      {"deviceIndex", device_index},
+      {"resourceViewHandle", resource_view.handle == 0u ? json(nullptr) : json(FormatHandle(context, resource_view.handle))},
+      {"resourceHandle", FormatHandle(context, target.resolved_resource.handle)},
+      {"layout", resolved_layout},
+      {"format", FormatFormat(context, analysis_format)},
+      {"dimensions", {{"nx", nx}, {"ny", ny}, {"nz", nz}, {"isCubic", is_cubic}, {"voxelCount", voxel_count}}},
+      {"range", {
+                    {"min", global_min},
+                    {"max", global_max},
+                    {"clipsToSdr", global_max <= 1.001 && global_min >= -0.001},
+                    {"hasHdrValues", global_max > 1.001},
+                    {"hasNegativeValues", global_min < -0.001},
+                    {"voxelsAboveOne", RatioStats(above_one_count, finite_count)},
+                    {"voxelsBelowZero", RatioStats(below_zero_count, finite_count)},
+                    {"nanCount", nan_count},
+                    {"infCount", inf_count},
+                    {"channels", {
+                                     {"r", ScalarStats(ch_min[0], ch_max[0], ch_sum[0], finite_count)},
+                                     {"g", ScalarStats(ch_min[1], ch_max[1], ch_sum[1], finite_count)},
+                                     {"b", ScalarStats(ch_min[2], ch_max[2], ch_sum[2], finite_count)},
+                                 }},
+                }},
+      {"identity", {
+                       {"maxDelta", identity_max_delta},
+                       {"meanDelta", identity_mean_delta},
+                       {"isNearIdentity", identity_max_delta < 0.005},
+                   }},
+      {"neutralAxisSummary", {
+                                 {"blackLift", black_lift},
+                                 {"whiteLuminance", white_lum},
+                                 {"luminanceAt018", lum_018},
+                                 {"luminanceAt050", lum_050},
+                                 {"midtoneSlope", midtone_slope},
+                                 {"shoulderSlope", shoulder_slope},
+                                 {"monotonic", neutral_monotonic},
+                                 {"bakedTonemapAssessment", baked_tonemap_assessment},
+                                 {"estimatedInputSpace", estimated_input_space},
+                                 {"curveErrors", {
+                                                     {"maeIdentity", mae_identity},
+                                                     {"maeLinearToGamma22", mae_lin_to_srgb},
+                                                     {"maeGamma22ToLinear", mae_srgb_to_lin},
+                                                 }},
+                             }},
+      {"neutralAxis", neutral_axis_json},
+      {"corners", corners_json},
+  };
+  if (!exports_json.empty()) {
+    result["exports"] = exports_json;
+  }
+
+  if (spec.export_json_path.has_value()) {
+    std::error_code dir_error;
+    if (!spec.export_json_path->parent_path().empty()) {
+      std::filesystem::create_directories(spec.export_json_path->parent_path(), dir_error);
+    }
+    std::ofstream json_out(spec.export_json_path.value(), std::ios::out | std::ios::trunc);
+    if (!json_out.is_open()) {
+      const auto error = std::format("Failed to open '{}' for JSON export.", spec.export_json_path->string());
+      return ToolResult{
+          .text = error,
+          .structured_content = json{{"error", error}},
+          .is_error = true,
+      };
+    }
+    json_out << result.dump(2) << '\n';
+    json_out.flush();
+    result["exports"]["json"] = {{"path", spec.export_json_path->string()}};
+  }
+
+  auto text = std::format(
+      "Analyzed {}x{}x{} {} LUT ({}) on device #{}: range [{:.4f}, {:.4f}], blackLift={:.4f}, whiteLum={:.4f}, assessment={}, inputSpace={}.",
+      nx,
+      ny,
+      nz,
+      FormatFormat(context, analysis_format),
+      resolved_layout,
+      device_index,
+      global_min,
+      global_max,
+      black_lift,
+      white_lum,
+      baked_tonemap_assessment,
+      estimated_input_space);
+  return ToolResult{
+      .text = text,
+      .structured_content = result,
+  };
 }
 
 }  // namespace internal
@@ -1314,6 +2383,274 @@ inline void EncodePreviewPixel(
   return request->result.value();
 }
 
+[[nodiscard]] inline ToolResult HandleScanPassResourcesTool(const json& arguments, const ToolContext& context) {
+  if (!context.resolve_device_index || !context.enqueue_request) {
+    throw std::runtime_error("AnalyzeResourceToolContext is not initialized.");
+  }
+
+  const auto device_index = context.resolve_device_index(arguments);
+  const auto max_resources = mcp_arguments::ValidateRange(
+      "maxResources",
+      mcp_arguments::GetOptional<std::uint32_t>(arguments, "maxResources").value_or(16u),
+      1u,
+      32u);
+  const auto prefer_clone = mcp_arguments::GetOptional<bool>(arguments, "preferClone").value_or(false);
+  const auto include_output_chain = mcp_arguments::GetOptional<bool>(arguments, "includeOutputChain").value_or(false);
+
+  std::vector<ScanTargetSpec> targets;
+  std::vector<std::pair<std::uint64_t, std::uint64_t>> seen_keys;
+  const auto try_add_target = [&](ScanTargetSpec spec) {
+    if (targets.size() >= max_resources) return;
+    if (spec.resource_view.handle == 0u && spec.resource.handle == 0u) return;
+    const auto key = std::make_pair(spec.resource_view.handle, spec.resource.handle);
+    if (std::find(seen_keys.begin(), seen_keys.end(), key) != seen_keys.end()) return;
+    seen_keys.push_back(key);
+    targets.push_back(std::move(spec));
+  };
+
+  if (arguments.contains("resourceViewHandles") && arguments["resourceViewHandles"].is_array()) {
+    for (const auto& item : arguments["resourceViewHandles"]) {
+      const auto handle = resource_handle::Parse("resourceViewHandles[]", item);
+      try_add_target(ScanTargetSpec{
+          .resource_view = reshade::api::resource_view{handle},
+          .label = item.is_string() ? item.get<std::string>() : std::format("0x{:016X}", handle),
+      });
+    }
+  }
+
+  if (arguments.contains("resourceHandles") && arguments["resourceHandles"].is_array()) {
+    for (const auto& item : arguments["resourceHandles"]) {
+      const auto handle = resource_handle::Parse("resourceHandles[]", item);
+      try_add_target(ScanTargetSpec{
+          .resource = reshade::api::resource{handle},
+          .label = item.is_string() ? item.get<std::string>() : std::format("0x{:016X}", handle),
+      });
+    }
+  }
+
+  std::vector<std::uint32_t> draw_indices;
+  if (arguments.contains("drawIndices") && arguments["drawIndices"].is_array()) {
+    for (const auto& item : arguments["drawIndices"]) {
+      if (!item.is_number_integer() || item.get<std::int64_t>() < 0) {
+        throw std::runtime_error("drawIndices entries must be non-negative integers.");
+      }
+      draw_indices.push_back(static_cast<std::uint32_t>(item.get<std::uint64_t>()));
+    }
+  }
+
+  if ((!draw_indices.empty() || include_output_chain) && context.resolve_scan_targets) {
+    for (auto& spec : context.resolve_scan_targets(device_index, draw_indices, include_output_chain)) {
+      try_add_target(std::move(spec));
+    }
+  }
+
+  if (targets.empty()) {
+    throw std::runtime_error(
+        "No scan targets were resolved. Provide resourceViewHandles, resourceHandles, drawIndices, or set includeOutputChain=true with an active snapshot.");
+  }
+
+  auto request = std::make_shared<PendingRequest>();
+  request->batch_targets = std::move(targets);
+  request->prefer_clone = prefer_clone;
+
+  if (!context.enqueue_request(device_index, request)) {
+    const auto error = std::format("Failed to queue the batch resource scan request for device #{}.", device_index);
+    return ToolResult{
+        .text = error,
+        .structured_content = json{{"error", error}},
+        .is_error = true,
+    };
+  }
+
+  {
+    std::unique_lock request_lock(request->mutex);
+    if (!request->cv.wait_for(request_lock, std::chrono::seconds(20), [&request] { return request->completed || request->started; })) {
+      request->canceled = true;
+      request_lock.unlock();
+      if (context.cancel_request) {
+        context.cancel_request(device_index, request);
+      }
+      return ToolResult{
+          .text = "Timed out waiting for the next present to process the batch resource scan request.",
+          .structured_content = json{{"error", "Timed out waiting for the next present to process the batch resource scan request."}},
+          .is_error = true,
+      };
+    }
+
+    if (!request->completed) {
+      request->cv.wait(request_lock, [&request] { return request->completed; });
+    }
+  }
+
+  if (!request->result.has_value()) {
+    return ToolResult{
+        .text = "The batch resource scan request completed without a result.",
+        .structured_content = json{{"error", "The batch resource scan request completed without a result."}},
+        .is_error = true,
+    };
+  }
+
+  return request->result.value();
+}
+
+[[nodiscard]] inline ToolResult HandleAnalyzeLutTool(const json& arguments, const ToolContext& context) {
+  if (!context.resolve_device_index || !context.enqueue_request) {
+    throw std::runtime_error("AnalyzeResourceToolContext is not initialized.");
+  }
+
+  const auto device_index = context.resolve_device_index(arguments);
+  const auto prefer_clone = mcp_arguments::GetOptional<bool>(arguments, "preferClone").value_or(false);
+  const auto layout = mcp_arguments::GetOptional<std::string>(arguments, "layout").value_or("auto");
+  const auto lut_size = mcp_arguments::GetOptional<std::uint32_t>(arguments, "lutSize");
+
+  uint64_t view_handle = 0u;
+  uint64_t res_handle = 0u;
+  if (arguments.contains("resourceViewHandle") && !arguments["resourceViewHandle"].is_null()) {
+    view_handle = resource_handle::GetRequired(arguments, "resourceViewHandle");
+  }
+  if (arguments.contains("resourceHandle") && !arguments["resourceHandle"].is_null()) {
+    res_handle = resource_handle::GetRequired(arguments, "resourceHandle");
+  }
+  if (view_handle == 0u && res_handle == 0u) {
+    throw std::runtime_error("Either resourceViewHandle or resourceHandle is required.");
+  }
+
+  const auto parse_abs_path = [&arguments](std::string_view key, std::string_view expected_ext) -> std::optional<std::filesystem::path> {
+    const auto raw = mcp_arguments::GetOptional<std::string>(arguments, key).value_or("");
+    if (raw.empty()) return std::nullopt;
+    auto path = std::filesystem::path(raw);
+    if (!path.is_absolute()) {
+      throw std::runtime_error(std::format("{} must be an absolute path.", key));
+    }
+    if (!expected_ext.empty() && !path.has_extension()) {
+      path.replace_extension(expected_ext);
+    }
+    return path.lexically_normal();
+  };
+
+  LutAnalysisSpec spec = {
+      .layout = layout,
+      .lut_size = lut_size,
+      .export_cube_path = parse_abs_path("exportCubePath", ".cube"),
+      .export_json_path = parse_abs_path("exportJsonPath", ".json"),
+      .export_preview_path = parse_abs_path("exportPreviewPath", ".png"),
+  };
+  if (spec.export_preview_path.has_value()) {
+    const auto ext = spec.export_preview_path->extension();
+    if (ext != L".png" && ext != L".exr") {
+      throw std::runtime_error("exportPreviewPath must end in '.png' or '.exr'.");
+    }
+  }
+
+  auto request = std::make_shared<PendingRequest>();
+  request->resource_view = reshade::api::resource_view{view_handle};
+  request->resource = reshade::api::resource{res_handle};
+  request->lut_analysis = std::move(spec);
+  request->prefer_clone = prefer_clone;
+
+  if (!context.enqueue_request(device_index, request)) {
+    const auto error = std::format("Failed to queue the LUT analysis request for device #{}.", device_index);
+    return ToolResult{
+        .text = error,
+        .structured_content = json{{"error", error}},
+        .is_error = true,
+    };
+  }
+
+  {
+    std::unique_lock request_lock(request->mutex);
+    if (!request->cv.wait_for(request_lock, std::chrono::seconds(15), [&request] { return request->completed || request->started; })) {
+      request->canceled = true;
+      request_lock.unlock();
+      if (context.cancel_request) {
+        context.cancel_request(device_index, request);
+      }
+      return ToolResult{
+          .text = "Timed out waiting for the next present to process the LUT analysis request.",
+          .structured_content = json{{"error", "Timed out waiting for the next present to process the LUT analysis request."}},
+          .is_error = true,
+      };
+    }
+
+    if (!request->completed) {
+      request->cv.wait(request_lock, [&request] { return request->completed; });
+    }
+  }
+
+  if (!request->result.has_value()) {
+    return ToolResult{
+        .text = "The LUT analysis request completed without a result.",
+        .structured_content = json{{"error", "The LUT analysis request completed without a result."}},
+        .is_error = true,
+    };
+  }
+
+  return request->result.value();
+}
+
+[[nodiscard]] inline ToolResult HandleCompareResourceAbTool(const json& arguments, const ToolContext& context) {
+  if (!context.resolve_device_index || !context.enqueue_request) {
+    throw std::runtime_error("AnalyzeResourceToolContext is not initialized.");
+  }
+
+  const auto device_index = context.resolve_device_index(arguments);
+  const auto prefer_clone = mcp_arguments::GetOptional<bool>(arguments, "preferClone").value_or(false);
+  uint64_t view_handle = 0u;
+  uint64_t res_handle = 0u;
+  if (arguments.contains("resourceViewHandle") && !arguments["resourceViewHandle"].is_null()) {
+    view_handle = resource_handle::GetRequired(arguments, "resourceViewHandle");
+  }
+  if (arguments.contains("resourceHandle") && !arguments["resourceHandle"].is_null()) {
+    res_handle = resource_handle::GetRequired(arguments, "resourceHandle");
+  }
+  if (view_handle == 0u && res_handle == 0u) {
+    throw std::runtime_error("Either resourceViewHandle or resourceHandle is required.");
+  }
+
+  auto request = std::make_shared<PendingRequest>();
+  request->resource_view = reshade::api::resource_view{view_handle};
+  request->resource = reshade::api::resource{res_handle};
+  request->prefer_clone = prefer_clone;
+  request->ab_compare = AbCompareSpec{.active = true, .phase = 0u};
+
+  if (!context.enqueue_request(device_index, request)) {
+    const auto error = std::format("Failed to queue A/B resource comparison for device #{}.", device_index);
+    return ToolResult{
+        .text = error,
+        .structured_content = json{{"error", error}},
+        .is_error = true,
+    };
+  }
+
+  {
+    std::unique_lock request_lock(request->mutex);
+    if (!request->cv.wait_for(request_lock, std::chrono::seconds(20), [&request] { return request->completed || request->started; })) {
+      request->canceled = true;
+      request_lock.unlock();
+      if (context.cancel_request) {
+        context.cancel_request(device_index, request);
+      }
+      return ToolResult{
+          .text = "Timed out waiting for present to run A/B resource comparison.",
+          .structured_content = json{{"error", "Timed out waiting for present to run A/B resource comparison."}},
+          .is_error = true,
+      };
+    }
+    if (!request->completed) {
+      request->cv.wait(request_lock, [&request] { return request->completed; });
+    }
+  }
+
+  if (!request->result.has_value()) {
+    return ToolResult{
+        .text = "The A/B resource comparison completed without a result.",
+        .structured_content = json{{"error", "The A/B resource comparison completed without a result."}},
+        .is_error = true,
+    };
+  }
+  return request->result.value();
+}
+
 inline void ProcessPendingRequests(
     const std::deque<std::shared_ptr<PendingRequest>>& requests,
     std::uint32_t device_index,
@@ -1332,24 +2669,189 @@ inline void ProcessPendingRequests(
     }
     request->cv.notify_all();
 
+    if (request->ab_compare.has_value()) {
+      auto& ab = request->ab_compare.value();
+      try {
+        if (ab.phase == 0u) {
+          ab.with_live_result = internal::PerformResourceAnalysis(
+              context,
+              device_index,
+              device,
+              queue,
+              request->resource_view,
+              request->resource,
+              std::nullopt,
+              std::nullopt,
+              std::nullopt,
+              PreviewMode::CLAMPED,
+              "clamped",
+              request->prefer_clone);
+
+          if (ab.with_live_result->is_error) {
+            std::scoped_lock request_lock(request->mutex);
+            request->result = ab.with_live_result;
+            request->completed = true;
+            request->cv.notify_all();
+            continue;
+          }
+
+          ab.suspended_live_shaders = context.suspend_live_shaders ? context.suspend_live_shaders(device) : false;
+          if (!ab.suspended_live_shaders || !context.requeue_request) {
+            json result = {
+                {"deviceIndex", device_index},
+                {"liveShadersWereActive", false},
+                {"withLiveShaders", ab.with_live_result->structured_content},
+                {"vanilla", nullptr},
+                {"delta", nullptr},
+            };
+            std::scoped_lock request_lock(request->mutex);
+            request->result = ToolResult{
+                .text = "No active live shaders were loaded to toggle for A/B comparison; returned current resource analysis only.",
+                .structured_content = result,
+            };
+            request->completed = true;
+            request->cv.notify_all();
+            continue;
+          }
+
+          ab.phase = 1u;
+          context.requeue_request(device_index, request);
+          continue;
+        }
+
+        // Phase 1 (next frame, rendered vanilla):
+        const auto vanilla_result = internal::PerformResourceAnalysis(
+            context,
+            device_index,
+            device,
+            queue,
+            request->resource_view,
+            request->resource,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
+            PreviewMode::CLAMPED,
+            "clamped",
+            request->prefer_clone);
+
+        if (ab.suspended_live_shaders && context.restore_live_shaders) {
+          context.restore_live_shaders(device);
+        }
+
+        if (vanilla_result.is_error) {
+          std::scoped_lock request_lock(request->mutex);
+          request->result = vanilla_result;
+          request->completed = true;
+          request->cv.notify_all();
+          continue;
+        }
+
+        const auto& a = ab.with_live_result->structured_content["analysis"];
+        const auto& b = vanilla_result.structured_content["analysis"];
+        const auto num_delta = [](const json& lhs, const json& rhs) -> json {
+          if (lhs.is_number() && rhs.is_number()) {
+            return json(lhs.get<double>() - rhs.get<double>());
+          }
+          return json(nullptr);
+        };
+        const auto int_delta = [](const json& lhs, const json& rhs) -> json {
+          if (lhs.is_number_integer() && rhs.is_number_integer()) {
+            return json(lhs.get<std::int64_t>() - rhs.get<std::int64_t>());
+          }
+          return json(nullptr);
+        };
+
+        json delta = {
+            {"luminanceMaxDelta", num_delta(a["luminance"]["max"], b["luminance"]["max"])},
+            {"luminanceMeanDelta", num_delta(a["luminance"]["mean"], b["luminance"]["mean"])},
+            {"luminanceP99Delta", num_delta(a["percentiles"]["luminanceP99"], b["percentiles"]["luminanceP99"])},
+            {"luminanceP999Delta", num_delta(a["percentiles"]["luminanceP999"], b["percentiles"]["luminanceP999"])},
+            {"maxRgbP99Delta", num_delta(a["percentiles"]["maxRgbP99"], b["percentiles"]["maxRgbP99"])},
+            {"maxRgbP999Delta", num_delta(a["percentiles"]["maxRgbP999"], b["percentiles"]["maxRgbP999"])},
+            {"pixelsAboveOneDelta", int_delta(a["pixelsAnyChannelAbove1"]["count"], b["pixelsAnyChannelAbove1"]["count"])},
+            {"pixelsNegativeDelta", int_delta(a["pixelsAnyNegative"]["count"], b["pixelsAnyNegative"]["count"])},
+            {"nanPixelsDelta", int_delta(a["nanPixels"]["count"], b["nanPixels"]["count"])},
+            {"infPixelsDelta", int_delta(a["infPixels"]["count"], b["infPixels"]["count"])},
+            {"gamutBt709RatioDelta", num_delta(a["gamut"]["bt709"]["ratio"], b["gamut"]["bt709"]["ratio"])},
+            {"gamutDciP3OnlyRatioDelta", num_delta(a["gamut"]["dciP3Only"]["ratio"], b["gamut"]["dciP3Only"]["ratio"])},
+            {"gamutBt2020OnlyRatioDelta", num_delta(a["gamut"]["bt2020Only"]["ratio"], b["gamut"]["bt2020Only"]["ratio"])},
+        };
+
+        json result = {
+            {"deviceIndex", device_index},
+            {"liveShadersWereActive", true},
+            {"delta", delta},
+            {"withLiveShaders", a},
+            {"vanilla", b},
+        };
+
+        std::scoped_lock request_lock(request->mutex);
+        request->result = ToolResult{
+            .text = std::format(
+                "Completed live-shader A/B comparison on device #{}: maxLum delta={}, pixelsAbove1 delta={}, pixelsNegative delta={}, nan delta={}.",
+                device_index,
+                delta["luminanceMaxDelta"].dump(),
+                delta["pixelsAboveOneDelta"].dump(),
+                delta["pixelsNegativeDelta"].dump(),
+                delta["nanPixelsDelta"].dump()),
+            .structured_content = result,
+        };
+        request->completed = true;
+      } catch (const std::exception& exception) {
+        if (ab.suspended_live_shaders && context.restore_live_shaders) {
+          context.restore_live_shaders(device);
+        }
+        std::scoped_lock request_lock(request->mutex);
+        request->result = ToolResult{
+            .text = exception.what(),
+            .structured_content = json{{"error", exception.what()}},
+            .is_error = true,
+        };
+        request->completed = true;
+      }
+      request->cv.notify_all();
+      continue;
+    }
+
     ToolResult result = {
         .text = "Unknown resource analysis failure.",
         .structured_content = json{{"error", "Unknown resource analysis failure."}},
         .is_error = true,
     };
     try {
-      result = internal::PerformResourceAnalysis(
-          context,
-          device_index,
-          device,
-          queue,
-          request->resource_view,
-          request->output_path,
-          request->output_directory,
-          request->name_prefix,
-          request->preview_mode,
-          request->preview_mode_name,
-          request->prefer_clone);
+      if (request->batch_targets.has_value()) {
+        result = internal::PerformBatchPassScan(
+            context,
+            device_index,
+            device,
+            queue,
+            request->batch_targets.value(),
+            request->prefer_clone);
+      } else if (request->lut_analysis.has_value()) {
+        result = internal::PerformLutAnalysis(
+            context,
+            device_index,
+            device,
+            queue,
+            request->resource_view,
+            request->resource,
+            request->lut_analysis.value(),
+            request->prefer_clone);
+      } else {
+        result = internal::PerformResourceAnalysis(
+            context,
+            device_index,
+            device,
+            queue,
+            request->resource_view,
+            request->resource,
+            request->output_path,
+            request->output_directory,
+            request->name_prefix,
+            request->preview_mode,
+            request->preview_mode_name,
+            request->prefer_clone);
+      }
     } catch (const std::exception& exception) {
       result = ToolResult{
           .text = exception.what(),

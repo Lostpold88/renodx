@@ -159,6 +159,9 @@ struct DrawSummary {
   std::size_t constant_count = 0u;
   std::size_t render_target_count = 0u;
   std::size_t pipeline_count = 0u;
+  bool blend_enabled = false;
+  bool writes_backbuffer = false;
+  bool is_fullscreen_pass = false;
   std::vector<std::string> shader_hashes;
   std::optional<std::string> copy_source_handle = std::nullopt;
   std::optional<std::string> copy_destination_handle = std::nullopt;
@@ -183,6 +186,9 @@ inline void to_json(json& j, const DrawSummary& value) {
       {"constantCount", value.constant_count},
       {"renderTargetCount", value.render_target_count},
       {"pipelineCount", value.pipeline_count},
+      {"blendEnabled", value.blend_enabled},
+      {"writesBackbuffer", value.writes_backbuffer},
+      {"isFullscreenPass", value.is_fullscreen_pass},
       {"shaderHashes", value.shader_hashes},
   };
   if (value.copy_source_handle.has_value()) {

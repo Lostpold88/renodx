@@ -26,7 +26,7 @@ flowchart LR
     Protocol["utils/mcp/protocol.hpp<br/>protocol helpers"]
     Server["utils/mcp/server.hpp<br/>generic MCP Server"]
     Catalog["tool_catalog.hpp<br/>typed metadata"]
-    Handlers["tool headers<br/>snapshot_tools / shader_inspection / live_shaders / resource_analysis / resource_clone / texture_replace"]
+    Handlers["tool headers<br/>snapshot_tools / output_chain / deep_analysis / shader_inspection / live_shaders / resource_analysis / resource_clone / texture_replace"]
     Context["ToolContext callbacks"]
     Addon["addons/devkit/addon.cpp"]
     Runtime["tracked devices / shaders / resources / snapshots"]
@@ -75,10 +75,12 @@ This keeps tool definitions readable without building large raw JSON blobs by ha
 | [`snapshot_summary.hpp`](/C:/Mods/renodx/src/addons/devkit/mcp/snapshot_summary.hpp) | Typed MCP parcel for per-device snapshot-cache summaries. |
 | [`shader_hash.hpp`](/C:/Mods/renodx/src/addons/devkit/mcp/shader_hash.hpp) | Shader hash parsing for shader-inspection and live-shader tools. |
 | [`resource_handle.hpp`](/C:/Mods/renodx/src/addons/devkit/mcp/resource_handle.hpp) | Resource-handle parsing for resource-clone and resource-analysis tools. |
-| [`snapshot_tools.hpp`](/C:/Mods/renodx/src/addons/devkit/mcp/snapshot_tools.hpp) | Snapshot/status/list/select tool handlers over a callback context. |
+| [`snapshot_tools.hpp`](/C:/Mods/renodx/src/addons/devkit/mcp/snapshot_tools.hpp) | Snapshot, status/tracking, swapchain info, resource listing, shader bypass, draw listing, and device selection handlers. |
+| [`output_chain.hpp`](/C:/Mods/renodx/src/addons/devkit/mcp/output_chain.hpp) | Backwards backbuffer-to-upstream post-processing graph tracer, UI boundary detector, pass classifier (`devkit_classify_postprocess`), and format bottleneck reporter (`devkit_trace_output_chain`). |
+| [`deep_analysis.hpp`](/C:/Mods/renodx/src/addons/devkit/mcp/deep_analysis.hpp) | Draw constant buffer & push-constant readback/diff (`devkit_get_draw_constants`, `devkit_diff_draw_constants`), snapshot profile save/list/compare (`devkit_compare_snapshots`), and in-memory 1-frame API trace capture/log (`devkit_queue_trace`, `devkit_get_trace_log`). |
 | [`shader_inspection.hpp`](/C:/Mods/renodx/src/addons/devkit/mcp/shader_inspection.hpp) | Shader summary/disassembly/decompilation tool handlers. |
-| [`live_shaders.hpp`](/C:/Mods/renodx/src/addons/devkit/mcp/live_shaders.hpp) | Dump/load/unload live shader tool handlers. |
-| [`resource_analysis.hpp`](/C:/Mods/renodx/src/addons/devkit/mcp/resource_analysis.hpp) | Resource readback, preview, EXR/PNG dump, and hash-named dump handlers. |
+| [`live_shaders.hpp`](/C:/Mods/renodx/src/addons/devkit/mcp/live_shaders.hpp) | Dump/load/unload live shader and live compilation/draw-count status (`devkit_get_live_shader_status`) tool handlers. |
+| [`resource_analysis.hpp`](/C:/Mods/renodx/src/addons/devkit/mcp/resource_analysis.hpp) | 2D/3D resource readback (with p99/p99.9 percentiles and gamut breakdown), 3D/strip LUT analysis (`devkit_analyze_lut`), single-frame batch pass scanner (`devkit_scan_pass_resources`), 2-frame live-vs-vanilla A/B readback (`devkit_compare_resource_ab`), preview, EXR/PNG dump, and hash-named dump handlers. |
 | [`resource_clone.hpp`](/C:/Mods/renodx/src/addons/devkit/mcp/resource_clone.hpp) | Clone hotswap toggle tool handler. |
 | [`texture_replace.hpp`](/C:/Mods/renodx/src/addons/devkit/mcp/texture_replace.hpp) | Texture replacement rule, observation, dump, and enable-state tool handlers. |
 
@@ -167,6 +169,9 @@ Supported filter fields:
 - `method` (string, case-insensitive exact match)
 - `shaderHash` (string, case-insensitive exact match against `shaderHashes`)
 - `activeShaderStage` (string, case-insensitive exact match)
+- `writesBackbuffer` (boolean)
+- `isFullscreenPass` (boolean)
+- `blendEnabled` (boolean)
 - `minSrvCount` (integer)
 - `minUavCount` (integer)
 - `minConstantCount` (integer)
@@ -191,6 +196,24 @@ Response additions:
 - `totalDraws`: unfiltered snapshot draw count
 - `totalFilteredDraws`: count after filter application
 - `filters`: echo of applied filter fields
+
+## Idle Mode & Output Chain Tools
+
+- DevKit starts in **Idle (low-overhead) mode** by default (`StartActive=0`, with `KeepDescriptorTrackingInIdle=1` so static Vulkan/DX12 descriptor tables remain available for chain tracing). Use `devkit_set_tracking_active` to toggle hot-path hooks on/off at runtime, or pass `returnToIdle: true` to `devkit_queue_snapshot` (default when currently Idle) for one-shot capture.
+- Tool responses include serialized JSON in `content[0].text` alongside `structuredContent` for compatibility with MCP clients that only surface text content blocks.
+- 3D texture readback (`devkit_analyze_resource` and `devkit_analyze_lut`) automatically falls back to `copy_texture_to_buffer` staging buffers on APIs like Vulkan and D3D12 where `gpu_to_cpu` 3D textures are unsupported.
+- `devkit_get_swapchain_info` reports the graphics API, swapchain format/dimensions/backbuffer handles, color space, HDR status, and device proxy state.
+- `devkit_list_resources` enumerates tracked GPU resources with type, format, dimension, backbuffer, and snapshot usage filters.
+- `devkit_set_shader_bypass` toggles live draw/dispatch bypass for a shader hash.
+- `devkit_trace_output_chain` walks backwards from swapchain backbuffer(s) through snapshot RTV/UAV/Copy → SRV links to locate the post-processing chain, UI/HUD boundary, and format bottlenecks.
+- `devkit_classify_postprocess` heuristically classifies passes in the traced output chain (tonemap/grade, LUT, bloom, sharpen, HDR10/scRGB/SDR swapchain output, copy/resolve) and surfaces detected 3D/2D LUT handles.
+- `devkit_analyze_lut` reads back 3D textures (`texture_3d`) and 2D strip LUTs (`256x16`, `1024x32`, etc.), reports range/clipping, neutral axis curve, black lift, white point, primary/secondary corner shifts, baked-tonemap & input-space heuristics, and optionally exports `.cube`, `.json`, or unwrapped `.png`/`.exr`.
+- `devkit_scan_pass_resources` runs a single-frame batch GPU readback across up to 32 2D texture targets (or `includeOutputChain: true`) and reports per-pass min/max/mean/p99/p99.9, gamut distribution, NaN/Inf counts, and `hdrDropOff`.
+- `devkit_get_draw_constants` & `devkit_diff_draw_constants` read bound CBVs/UBOs (cached or via live GPU `copy_buffer_region` staging readback) plus captured push constants, save named baselines, and diff changed `cbN[reg].xyzw` / push-constant offsets.
+- `devkit_compare_snapshots` saves, lists, and diffs snapshot profiles (added/removed shaders, draw-count changes, target formats, swapchain changes, output-chain diffs).
+- `devkit_get_live_shader_status` reports live shader directory, active runtime replacement count, per-file compilation status & exact error message, and `snapshotDrawCount`.
+- `devkit_compare_resource_ab` runs an automated 2-frame A/B readback (with live shader replacements vs. temporarily suspended vanilla) and returns luminance, p99/p99.9, HDR/WCG, NaN, and gamut deltas.
+- `devkit_queue_trace` & `devkit_get_trace_log` trigger a 1-frame API trace into an in-memory buffer (plus `ReShade.log`) with optional `returnToIdle` and retrieve filtered/paged trace lines.
 
 ## Version Metadata
 
