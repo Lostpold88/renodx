@@ -11,6 +11,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <exception>
 #include <filesystem>
@@ -716,6 +717,18 @@ inline void EncodePreviewPixel(
       rgba[1] = DecodeFloat16(packed[1]);
       rgba[2] = DecodeFloat16(packed[2]);
       rgba[3] = DecodeFloat16(packed[3]);
+      return true;
+    }
+    case reshade::api::format::r16g16b16a16_unorm: {
+      const auto* packed = reinterpret_cast<const uint16_t*>(pixel);
+      rgba[0] = packed[0] / 65535.f;
+      rgba[1] = packed[1] / 65535.f;
+      rgba[2] = packed[2] / 65535.f;
+      rgba[3] = packed[3] / 65535.f;
+      return true;
+    }
+    case reshade::api::format::r32g32b32a32_float: {
+      std::memcpy(rgba, pixel, sizeof(float) * 4u);
       return true;
     }
     default:
@@ -2045,13 +2058,16 @@ struct MappedTextureReadback {
   } else if ((lum_018 > 0.34 && lum_050 > 0.65 && lum_100 <= 1.05)
              // Log/PQ shaper baked with a tonemap: crushed toe, steep mids, flat shoulder (e.g. Unreal's 32^3 log LUT)
              || (lum_010 < 0.02 && midtone_slope > 0.1 && shoulder_slope < (midtone_slope * 0.2) && lum_100 <= 1.05)) {
-    estimated_input_space = "log_or_hdr_shaper_to_sdr";
+    // A PQ axis spans 0..10000 nits, so SDR white is reached early; a log axis (e.g. Unreal) fills nearly the whole range.
+    const auto white_reached = std::ranges::find_if(neutral_samples, [lum_100](const NeutralSample& sample) { return sample.lum >= 0.98 * lum_100; });
+    const bool white_reached_early = white_reached != neutral_samples.end() && white_reached->input < 0.8;
+    estimated_input_space = (white_reached_early ? "pq_shaper_to_sdr" : "log_shaper_to_sdr");
   } else if (identity_max_delta < 0.005) {
     estimated_input_space = "identity_space_preserving";
   }
 
   // Gamma and identity comparisons assume a linear or gamma-encoded input axis; on a shaped axis they mean nothing.
-  const bool shaped_input_axis = estimated_input_space == "log_or_hdr_shaper_to_sdr";
+  const bool shaped_input_axis = estimated_input_space.ends_with("_shaper_to_sdr");
   if (shaped_input_axis) {
     for (auto& entry : neutral_axis_json) {
       entry["effectiveGamma"] = nullptr;

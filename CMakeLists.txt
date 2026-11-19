@@ -74,6 +74,26 @@ target_include_directories(mcp_bridge SYSTEM PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/
 target_compile_definitions(mcp_bridge PRIVATE NOMINMAX)
 set_target_properties(mcp_bridge PROPERTIES OUTPUT_NAME "renodx-mcp-bridge")
 
+# Build identity for src/utils/build_info.hpp (devkit + MCP bridge serverInfo).
+# Captured at configure time, like the resource .rc version below.
+execute_process(
+  COMMAND git describe --always --dirty
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  OUTPUT_VARIABLE RENODX_GIT_VERSION
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+  ERROR_QUIET)
+if(NOT RENODX_GIT_VERSION)
+  set(RENODX_GIT_VERSION "unknown")
+endif()
+string(TIMESTAMP RENODX_CONFIGURE_TIMESTAMP_UTC "%Y-%m-%dT%H:%M:%SZ" UTC)
+set(RENODX_BUILD_INFO_DEFINITIONS
+  RENODX_BUILD_VERSION="${RENODX_GIT_VERSION}"
+  RENODX_BUILD_TIMESTAMP_UTC="${RENODX_CONFIGURE_TIMESTAMP_UTC}")
+if(DEFINED ENV{SOURCE_DATE_EPOCH})
+  list(APPEND RENODX_BUILD_INFO_DEFINITIONS RENODX_SOURCE_DATE_EPOCH="$ENV{SOURCE_DATE_EPOCH}")
+endif()
+target_compile_definitions(mcp_bridge PRIVATE ${RENODX_BUILD_INFO_DEFINITIONS})
+
 function(generate_resource_rc ADDON)
 
   string(TIMESTAMP VERSION_FALLBACK "0,%Y,%m%d,%H%M" UTC)
@@ -833,6 +853,9 @@ foreach(FILE ${ADDON_FILES})
   target_include_directories(${ADDON} SYSTEM PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/external/reshade)
   target_include_directories(${ADDON} PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include)
   #target_compile_definitions(${ADDON} PRIVATE _UNICODE)
+  if(ADDON STREQUAL "devkit")
+    target_compile_definitions(${ADDON} PRIVATE ${RENODX_BUILD_INFO_DEFINITIONS})
+  endif()
   set_target_properties(${ADDON}
     PROPERTIES
     PREFIX "renodx-"

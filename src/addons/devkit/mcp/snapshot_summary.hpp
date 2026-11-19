@@ -24,6 +24,8 @@ struct SnapshotSummary {
   std::size_t shader_usage_entries = 0u;
   std::size_t snapshot_rows = 0u;
   bool snapshot_rows_valid = false;
+  std::uint32_t snapshot_capture_count = 0u;
+  std::int64_t snapshot_captured_at_ms = 0;
 };
 
 // NOLINTNEXTLINE(readability-identifier-naming)
@@ -38,6 +40,9 @@ inline void to_json(json& j, const SnapshotSummary& value) {
       {"shaderUsageEntries", value.shader_usage_entries},
       {"snapshotRows", value.snapshot_rows},
       {"snapshotRowsValid", value.snapshot_rows_valid},
+      // snapshotRows* describe the overlay's row cache; these describe the capture itself.
+      {"snapshotCaptureCount", value.snapshot_capture_count},
+      {"snapshotCapturedAtMs", value.snapshot_captured_at_ms == 0 ? json(nullptr) : json(value.snapshot_captured_at_ms)},
   };
 }
 

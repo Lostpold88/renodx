@@ -12,6 +12,7 @@
 #include <format>
 #include <functional>
 #include <limits>
+#include <map>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -78,6 +79,9 @@ struct TrackingStateSummary {
   bool requested = false;
   bool start_active = false;
   bool pending_return_to_idle = false;
+  std::uint32_t bypassed_shader_count = 0u;
+  // Which hook groups are registered right now (Idle keeps only the cold-path ones).
+  std::map<std::string, bool> hook_subsystems;
 };
 
 struct ToolContext {
@@ -265,6 +269,8 @@ inline ToolResult HandleStatusTool([[maybe_unused]] const json& arguments, const
                        {"requested", tracking.requested},
                        {"startActive", tracking.start_active},
                        {"pendingReturnToIdle", tracking.pending_return_to_idle},
+                       {"bypassedShaderCount", tracking.bypassed_shader_count},
+                       {"hookSubsystems", tracking.hook_subsystems},
                    }},
       {"deviceCount", device_count},
       {"devices", devices},
@@ -550,6 +556,8 @@ inline ToolResult HandleSetTrackingActiveTool(const json& arguments, const ToolC
       {"requested", state.requested},
       {"startActive", state.start_active},
       {"pendingReturnToIdle", state.pending_return_to_idle},
+      {"bypassedShaderCount", state.bypassed_shader_count},
+      {"hookSubsystems", state.hook_subsystems},
   };
   auto text = active
                   ? "Requested DevKit Active mode (hot-path tracking hooks will enable on next present)."

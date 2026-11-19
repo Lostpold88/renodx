@@ -79,6 +79,7 @@ Diese Funktionen existieren bereits im DevKit-Code (`src/addons/devkit/addon.cpp
   - PQ-/ST.2084-Konstanten (`0.15930175`, `78.84375`, `10000`) → **Native HDR10-Ausgabe**
   - 5-Tap-Nachbarschaft + `rcp`/`min`/`max` → **CAS / Sharpening**
   - Alpha-geblendete Quads auf Backbuffer nach dem letzten Fullscreen-Pass → **UI / HUD**
+- **Stand:** PQ-Konstanten (`pq_encode`), CAS (`sharpen_cas`), additiver Fullscreen-Blend (Bloom) und `ui_hud` sind umgesetzt. Die Shader-Evidenz stammt aus dem Disassembly-Text (Dezimal-Präfixe statt Bit-Muster) der Passes mit Abstand ≤ 2 zum Output; die UI-Grenze nutzt `elementCount` und Viewport-Abdeckung.
 
 ---
 

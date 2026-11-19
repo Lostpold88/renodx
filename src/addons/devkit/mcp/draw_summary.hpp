@@ -160,8 +160,15 @@ struct DrawSummary {
   std::size_t render_target_count = 0u;
   std::size_t pipeline_count = 0u;
   bool blend_enabled = false;
+  // Blending with destination factor `one` on the first target (bloom, glow and light accumulation).
+  bool additive_blend = false;
   bool writes_backbuffer = false;
   bool is_fullscreen_pass = false;
+  // Vertex count (draw) or index count (draw_indexed); 0 when unknown (dispatch, indirect, copy).
+  std::uint32_t element_count = 0u;
+  // First bound viewport and the share of the render target it covers (0..1), when known.
+  std::optional<std::array<float, 4>> viewport = std::nullopt;
+  std::optional<float> viewport_coverage = std::nullopt;
   std::vector<std::string> shader_hashes;
   std::optional<std::string> copy_source_handle = std::nullopt;
   std::optional<std::string> copy_destination_handle = std::nullopt;
@@ -187,8 +194,12 @@ inline void to_json(json& j, const DrawSummary& value) {
       {"renderTargetCount", value.render_target_count},
       {"pipelineCount", value.pipeline_count},
       {"blendEnabled", value.blend_enabled},
+      {"additiveBlend", value.additive_blend},
       {"writesBackbuffer", value.writes_backbuffer},
       {"isFullscreenPass", value.is_fullscreen_pass},
+      {"elementCount", value.element_count},
+      {"viewport", value.viewport.has_value() ? json(value.viewport.value()) : json(nullptr)},
+      {"viewportCoverage", value.viewport_coverage.has_value() ? json(value.viewport_coverage.value()) : json(nullptr)},
       {"shaderHashes", value.shader_hashes},
   };
   if (value.copy_source_handle.has_value()) {

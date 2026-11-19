@@ -35,6 +35,7 @@
 
 #include "../../../utils/mcp/arguments.hpp"
 #include "../../../utils/mcp/types.hpp"
+#include "../../../utils/resource.hpp"
 #include "../../../utils/trace.hpp"
 
 namespace renodx::addons::devkit::mcp::deep_analysis {
@@ -349,7 +350,17 @@ inline void ProcessPendingConstantsRequests(
         };
 
         const auto buffer = reshade::api::resource{binding.buffer_handle};
-        const auto desc = device->get_resource_desc(buffer);
+        // The handle comes from the snapshot; engines recycle constant buffers, so it may already be freed.
+        // Ask the resource tracker instead of the API: touching a freed D3D11 buffer crashes the driver.
+        reshade::api::resource_desc desc = {};
+        const bool is_live = renodx::utils::resource::GetLiveResourceInfo(buffer, [&](const renodx::utils::resource::ResourceInfo& info) {
+          desc = info.desc;
+        });
+        if (!is_live) {
+          cb_data.error = "Bound constant buffer was destroyed since the snapshot; queue a new snapshot.";
+          snap.constant_buffers.push_back(std::move(cb_data));
+          continue;
+        }
         if (desc.type != reshade::api::resource_type::buffer || desc.buffer.size == 0u || binding.offset >= desc.buffer.size) {
           cb_data.error = "Bound constant buffer is no longer valid or offset exceeds buffer size.";
           snap.constant_buffers.push_back(std::move(cb_data));
@@ -695,6 +706,22 @@ inline void ProcessPendingConstantsRequests(
       if (!target.target_formats.contains(fmt)) removed_formats.push_back(fmt);
     }
 
+    // Chains are ordered from the final output pass upward; the divergence index counts from that pass.
+    const auto [chain_before_mismatch, chain_after_mismatch] =
+        std::ranges::mismatch(baseline.output_chain_shaders, target.output_chain_shaders);
+    const bool chains_differ =
+        chain_before_mismatch != baseline.output_chain_shaders.end() || chain_after_mismatch != target.output_chain_shaders.end();
+    const std::set<std::string> chain_before_set(baseline.output_chain_shaders.begin(), baseline.output_chain_shaders.end());
+    const std::set<std::string> chain_after_set(target.output_chain_shaders.begin(), target.output_chain_shaders.end());
+    json chain_added = json::array();
+    json chain_removed = json::array();
+    for (const auto& hash : chain_after_set) {
+      if (!chain_before_set.contains(hash)) chain_added.push_back(hash);
+    }
+    for (const auto& hash : chain_before_set) {
+      if (!chain_after_set.contains(hash)) chain_removed.push_back(hash);
+    }
+
     const bool swapchain_changed =
         baseline.swapchain_format != target.swapchain_format
         || baseline.swapchain_color_space != target.swapchain_color_space
@@ -726,6 +753,9 @@ inline void ProcessPendingConstantsRequests(
         {"removedTargetFormats", removed_formats},
         {"outputChainBefore", baseline.output_chain_shaders},
         {"outputChainAfter", target.output_chain_shaders},
+        {"firstDivergenceIndex", chains_differ ? json(chain_before_mismatch - baseline.output_chain_shaders.begin()) : json(nullptr)},
+        {"outputChainAdded", chain_added},
+        {"outputChainRemoved", chain_removed},
         {"uiStartDrawBefore", baseline.ui_start_draw_index.has_value() ? json(baseline.ui_start_draw_index.value()) : json(nullptr)},
         {"uiStartDrawAfter", target.ui_start_draw_index.has_value() ? json(target.ui_start_draw_index.value()) : json(nullptr)},
     };
@@ -773,21 +803,36 @@ inline void ProcessPendingConstantsRequests(
   const auto snapshot = renodx::utils::trace::GetCapturedTraceSnapshot();
   const auto lowered_filter = filter.has_value() ? internal::ToLowerAscii(filter.value()) : std::string{};
 
-  std::vector<std::string> matched;
+  // Index into the captured trace, so entries stay addressable after filtering.
+  std::vector<std::size_t> matched;
   matched.reserve(snapshot.lines.size());
-  for (const auto& line : snapshot.lines) {
-    if (!lowered_filter.empty() && internal::ToLowerAscii(line).find(lowered_filter) == std::string::npos) {
+  for (std::size_t line_index = 0u; line_index < snapshot.lines.size(); ++line_index) {
+    if (!lowered_filter.empty() && internal::ToLowerAscii(snapshot.lines[line_index]).find(lowered_filter) == std::string::npos) {
       continue;
     }
-    matched.push_back(line);
+    matched.push_back(line_index);
   }
 
   const auto total_matched = matched.size();
   const auto clamped_offset = std::min<std::size_t>(offset, total_matched);
   const auto end_index = std::min<std::size_t>(clamped_offset + limit, total_matched);
+  const auto structured = mcp_arguments::GetOptional<bool>(arguments, "structured").value_or(true);
   json paged = json::array();
   for (std::size_t i = clamped_offset; i < end_index; ++i) {
-    paged.push_back(matched[i]);
+    const auto& line = snapshot.lines[matched[i]];
+    if (!structured) {
+      paged.push_back(line);
+      continue;
+    }
+    // Trace lines look like `event(arg, arg, ...)`; anything else is kept whole as the event.
+    const auto open_paren = line.find('(');
+    const auto close_paren = line.rfind(')');
+    const bool has_args = open_paren != std::string::npos && close_paren != std::string::npos && close_paren > open_paren;
+    paged.push_back(json{
+        {"index", matched[i]},
+        {"event", has_args ? line.substr(0u, open_paren) : line},
+        {"args", has_args ? line.substr(open_paren + 1u, close_paren - open_paren - 1u) : std::string{}},
+    });
   }
 
   json result = {
@@ -799,7 +844,7 @@ inline void ProcessPendingConstantsRequests(
       {"offset", clamped_offset},
       {"limit", limit},
       {"returned", paged.size()},
-      {"lines", paged},
+      {structured ? "entries" : "lines", paged},
   };
   if (filter.has_value()) {
     result["filter"] = filter.value();

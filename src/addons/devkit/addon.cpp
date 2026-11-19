@@ -28,6 +28,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <regex>
 #include <shared_mutex>
 #include <span>
 #include <sstream>
@@ -52,6 +53,7 @@
 #include "../../utils/format.hpp"
 #include "../../utils/icons.hpp"
 #include "../../utils/mcp/server.hpp"
+#include "../../utils/minhook.hpp"
 #include "../../utils/path.hpp"
 #include "../../utils/pipeline.hpp"
 #include "../../utils/pipeline_layout.hpp"
@@ -144,14 +146,17 @@ std::atomic_bool shaders_pane_show_pixel_shaders = true;
 std::atomic_bool shaders_pane_show_compute_shaders = true;
 
 std::atomic_bool setting_devkit_start_active = false;
-std::atomic_bool setting_keep_descriptor_tracking_in_idle = false;
+std::atomic_bool setting_keep_descriptor_tracking_in_idle = true;
 std::atomic_bool devkit_tracking_active = false;
 std::atomic_bool devkit_tracking_requested = false;
 std::atomic_bool snapshot_return_to_idle = false;
 std::atomic_bool trace_return_to_idle = false;
 std::shared_mutex devkit_tracking_mutex;
 
-uint32_t skip_draw_count = 0;
+// Written by the UI and MCP threads, read by draw hooks on the render thread.
+std::atomic_uint32_t skip_draw_count = 0;
+// Set when a bypass switched Idle tracking on, so removing the last bypass can switch it back off.
+std::atomic_bool bypass_forced_tracking = false;
 
 [[nodiscard]] bool SupportsSnapshotSubmissionOrder(reshade::api::device_api api) {
   return api == reshade::api::device_api::d3d12
@@ -272,6 +277,8 @@ struct DrawDetails {
   std::optional<reshade::api::blend_desc> blend_desc = std::nullopt;
   std::optional<reshade::api::rasterizer_desc> rasterizer_desc = std::nullopt;
   std::optional<std::vector<ResourceBind>> resource_binds = std::nullopt;
+  std::optional<reshade::api::viewport> viewport = std::nullopt;
+  uint32_t element_count = 0u;  // vertex or index count of direct draws
 
   reshade::api::resource copy_source = {0u};
   reshade::api::resource copy_destination = {0u};
@@ -360,6 +367,7 @@ struct __declspec(uuid("3224946b-5c5f-478a-8691-83fbb9f88f1b")) CommandListData 
   std::map<uint32_t, ResourceViewDetails> render_targets;
   std::optional<reshade::api::blend_desc> blend_desc = std::nullopt;
   std::optional<reshade::api::rasterizer_desc> rasterizer_desc = std::nullopt;
+  std::optional<reshade::api::viewport> viewport = std::nullopt;  // slot 0 only
   uint32_t draw_counter = 0u;
 
   // std::vector<PipelineBindDetails> pipeline_binds;
@@ -442,11 +450,17 @@ struct __declspec(uuid("0190ec1a-2e19-74a6-ad41-4df0d4d8caed")) DeviceData {
   std::vector<SnapshotRow> snapshot_rows;
   uint32_t snapshot_row_layout_key = 0u;
   uint32_t snapshot_rows_generation = 0u;
+  // Completed captures, so MCP clients can tell a fresh snapshot from the previous one.
+  uint32_t snapshot_capture_count = 0u;
+  std::int64_t snapshot_captured_at_ms = 0;
   bool snapshot_rows_valid = false;
   struct CachedSwapchainRuntimeInfo {
     reshade::api::color_space color_space = reshade::api::color_space::unknown;
     uint32_t current_backbuffer_index = 0u;
     std::vector<uint64_t> backbuffer_handles;
+    // Display (DXGI output) state; refreshed every few seconds because GetContainingOutput is not free.
+    std::optional<DXGI_OUTPUT_DESC1> output_desc = std::nullopt;
+    std::int64_t output_desc_queried_ms = 0;
   };
   std::unordered_map<reshade::api::swapchain*, reshade::api::swapchain_desc> swapchain_descs;
   std::unordered_map<reshade::api::swapchain*, CachedSwapchainRuntimeInfo> swapchain_runtime_info;
@@ -1949,7 +1963,8 @@ renodx::utils::resource::ResourceUpgradeInfo devkit_texture_file_clone_target = 
 
   renodx::utils::resource::ResourceInfo* info = nullptr;
   renodx::utils::resource::UpdateResourceInfo(resource, [&info](renodx::utils::resource::ResourceInfo* resource_info) {
-    info = resource_info;
+    // A destroyed entry's handle may dangle; callers treat it like an untracked resource.
+    if (!resource_info->destroyed) info = resource_info;
   });
   return info;
 }
@@ -2442,6 +2457,8 @@ std::vector<DeviceData*> device_data_list;
       .resource_usage_entries = device_data->resource_usage_by_handle.size(),
       .snapshot_queued = snapshot_queued_device == device,
       .snapshot_active = snapshot_device == device,
+      .snapshot_capture_count = device_data->snapshot_capture_count,
+      .snapshot_captured_at_ms = device_data->snapshot_captured_at_ms,
   };
 
   if (device_data->primary_swapchain_desc.has_value()) {
@@ -2647,14 +2664,30 @@ std::vector<DeviceData*> device_data_list;
            && desc.texture.width == backbuffer_width
            && desc.texture.height == backbuffer_height;
   };
+  std::optional<float> viewport_coverage = std::nullopt;
   for (const auto& [rtv_index, rtv_details] : draw_details.render_targets) {
-    (void)rtv_index;
     if (rtv_details.is_swapchain) {
       writes_backbuffer = true;
     }
-    if (matches_backbuffer_dims(rtv_details.resource_desc)) {
+    const auto& rt_desc = rtv_details.resource_desc;
+    if (rtv_index == 0u && draw_details.viewport.has_value()
+        && rt_desc.type != reshade::api::resource_type::buffer && rt_desc.texture.width > 0u && rt_desc.texture.height > 0u) {
+      const auto& vp = draw_details.viewport.value();
+      // Clip the viewport to the target, then take the covered area share.
+      const float x0 = std::max(vp.x, 0.f);
+      const float y0 = std::max(vp.y, 0.f);
+      const float x1 = std::min(vp.x + vp.width, static_cast<float>(rt_desc.texture.width));
+      const float y1 = std::min(vp.y + vp.height, static_cast<float>(rt_desc.texture.height));
+      viewport_coverage = std::max(x1 - x0, 0.f) * std::max(y1 - y0, 0.f)
+                          / (static_cast<float>(rt_desc.texture.width) * static_cast<float>(rt_desc.texture.height));
+    }
+    if (matches_backbuffer_dims(rt_desc)) {
       is_fullscreen_pass = true;
     }
+  }
+  // A backbuffer-sized target drawn through a partial viewport (minimap, split view) is not a fullscreen pass.
+  if (viewport_coverage.has_value() && viewport_coverage.value() < 0.95f) {
+    is_fullscreen_pass = false;
   }
   for (const auto& [slot_space, uav_details] : draw_details.uav_binds) {
     (void)slot_space;
@@ -2686,9 +2719,16 @@ std::vector<DeviceData*> device_data_list;
       .render_target_count = draw_details.render_targets.size(),
       .pipeline_count = draw_details.pipeline_binds.size(),
       .blend_enabled = blend_enabled,
+      .additive_blend = blend_enabled && draw_details.blend_desc->dest_color_blend_factor[0] == reshade::api::blend_factor::one,
       .writes_backbuffer = writes_backbuffer,
       .is_fullscreen_pass = is_fullscreen_pass,
+      .element_count = draw_details.element_count,
+      .viewport_coverage = viewport_coverage,
   };
+  if (draw_details.viewport.has_value()) {
+    const auto& vp = draw_details.viewport.value();
+    draw_summary.viewport = std::array<float, 4>{vp.x, vp.y, vp.width, vp.height};
+  }
   draw_summary.shader_hashes.reserve(shader_hashes.size());
   for (auto shader_hash : shader_hashes) {
     draw_summary.shader_hashes.push_back(FormatShaderHash(shader_hash));
@@ -4077,13 +4117,33 @@ void ProcessPendingLiveShaderRequests(
 }
 
 [[nodiscard]] devkit_snapshot_tools::TrackingStateSummary GetTrackingStateSummaryForMcp() {
+  const bool active = devkit_tracking_active.load();
+  // Mirrors the switches in SetDevkitTrackingActive.
   return devkit_snapshot_tools::TrackingStateSummary{
-      .active = devkit_tracking_active.load(),
+      .active = active,
       .requested = devkit_tracking_requested.load(),
       .start_active = setting_devkit_start_active.load(),
       .pending_return_to_idle = snapshot_return_to_idle.load(),
+      .bypassed_shader_count = skip_draw_count.load(),
+      .hook_subsystems = {
+          {"drawAndDispatch", active},
+          {"stateHotPath", active},
+          {"apiTrace", active},
+          {"renderPassEvents", active},
+          {"textureReplace", active},
+          {"descriptorTables", active || setting_keep_descriptor_tracking_in_idle.load()},
+          {"constantBufferCapture", active && renodx::utils::constants::capture_constant_buffers.load()},
+          {"pushConstantCapture", active && renodx::utils::constants::capture_push_descriptors.load()},
+          {"resourceLifetime", true},
+          {"pipelineCreation", true},
+          {"present", true},
+      },
   };
 }
+
+namespace hdr_metadata_hook {
+[[nodiscard]] json ToJson();
+}  // namespace hdr_metadata_hook
 
 [[nodiscard]] json BuildSwapchainInfoForMcp(uint32_t device_index) {
   std::shared_lock list_lock(device_data_list_mutex);
@@ -4099,6 +4159,7 @@ void ProcessPendingLiveShaderRequests(
     reshade::api::color_space color_space = reshade::api::color_space::unknown;
     json backbuffer_handles = json::array();
     uint32_t current_backbuffer_index = 0u;
+    json display = nullptr;
     if (const auto rt_it = device_data->swapchain_runtime_info.find(swapchain_ptr);
         rt_it != device_data->swapchain_runtime_info.end()) {
       color_space = rt_it->second.color_space;
@@ -4107,6 +4168,22 @@ void ProcessPendingLiveShaderRequests(
         if (bb_handle != 0u) {
           backbuffer_handles.push_back(FormatHandle(bb_handle));
         }
+      }
+      if (rt_it->second.output_desc.has_value()) {
+        const auto& out = rt_it->second.output_desc.value();
+        // The output's color space is what Windows drives the display in: G2084/P2020 means HDR is on in the OS.
+        display = {
+            {"osHdrEnabled", out.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020},
+            {"outputColorSpace", static_cast<uint32_t>(out.ColorSpace)},
+            {"bitsPerColor", out.BitsPerColor},
+            {"minLuminanceNits", out.MinLuminance},
+            {"maxLuminanceNits", out.MaxLuminance},
+            {"maxFullFrameLuminanceNits", out.MaxFullFrameLuminance},
+            {"redPrimary", {out.RedPrimary[0], out.RedPrimary[1]}},
+            {"greenPrimary", {out.GreenPrimary[0], out.GreenPrimary[1]}},
+            {"bluePrimary", {out.BluePrimary[0], out.BluePrimary[1]}},
+            {"whitePoint", {out.WhitePoint[0], out.WhitePoint[1]}},
+        };
       }
     }
     const bool is_hdr_color_space =
@@ -4127,6 +4204,8 @@ void ProcessPendingLiveShaderRequests(
         {"isHdrColorSpace", is_hdr_color_space},
         {"currentBackbufferIndex", current_backbuffer_index},
         {"backbufferHandles", backbuffer_handles},
+        {"isFlipModel", IsFlipSwapchainPresentMode(desc.present_mode)},
+        {"display", display},
     });
   }
 
@@ -4144,6 +4223,8 @@ void ProcessPendingLiveShaderRequests(
       {"primarySwapchainIsFlip", device_data->primary_swapchain_is_flip},
       {"swapchainCount", swapchains_json.size()},
       {"swapchains", swapchains_json},
+      // Last IDXGISwapChain4::SetHDRMetaData call from the game (process-wide).
+      {"gameHdrMetadata", hdr_metadata_hook::ToJson()},
       {"deviceProxy", {
                           {"enabled", proxy_enabled},
                           {"configuredOutputMode", setting_device_proxy_output_mode},
@@ -4225,6 +4306,20 @@ void ProcessPendingLiveShaderRequests(
   return resources;
 }
 
+// Caller holds the device mutex (MCP) or runs on the overlay thread (UI) and checked the flag changes.
+void SetShaderDrawBypass(ShaderDetails& details, bool bypass) {
+  details.bypass_draw = bypass;
+  skip_draw_count += bypass ? +1u : -1u;
+
+  // Bypass runs in the draw hooks, which only exist while tracking is active.
+  if (bypass && !devkit_tracking_requested.load()) {
+    devkit_tracking_requested.store(true);
+    bypass_forced_tracking.store(true);
+  } else if (!bypass && skip_draw_count.load() == 0u && bypass_forced_tracking.exchange(false)) {
+    devkit_tracking_requested.store(false);
+  }
+}
+
 [[nodiscard]] ToolResult SetShaderBypassForMcp(uint32_t device_index, uint32_t shader_hash, bool bypass) {
   std::shared_lock list_lock(device_data_list_mutex);
   if (device_index >= device_data_list.size()) {
@@ -4244,12 +4339,7 @@ void ProcessPendingLiveShaderRequests(
   }
 
   if (it->second.bypass_draw != bypass) {
-    it->second.bypass_draw = bypass;
-    skip_draw_count += bypass ? +1u : -1u;
-  }
-
-  if (bypass && !devkit_tracking_active.load()) {
-    devkit_tracking_requested.store(true);
+    SetShaderDrawBypass(it->second, bypass);
   }
 
   json bypassed_hashes = json::array();
@@ -4390,8 +4480,10 @@ void ProcessPendingLiveShaderRequests(
         .active_shader_stage = summary.active_shader_stage,
         .shader_hashes = summary.shader_hashes,
         .blend_enabled = summary.blend_enabled,
+        .additive_blend = summary.additive_blend,
         .writes_backbuffer = summary.writes_backbuffer,
         .is_fullscreen_pass = summary.is_fullscreen_pass,
+        .element_count = summary.element_count,
     };
 
     for (const auto& [slot_space, srv] : draw.srv_binds) {
@@ -4556,8 +4648,25 @@ void ProcessPendingLiveShaderRequests(
     }
 
     json compile_error = nullptr;
+    json diagnostics = json::array();
     if (!ok) {
-      compile_error = std::string(disk.GetCompilationException().what());
+      const std::string compile_error_text = disk.GetCompilationException().what();
+      compile_error = compile_error_text;
+      // FXC/DXC lines: `file(line,col[-col]): error X3004: message`; other lines are not diagnostics.
+      static const std::regex diagnostic_pattern(R"(^(.*)\((\d+),(\d+)(?:-\d+)?\):\s*(error|warning)\s+(\w+):\s*(.*)$)");
+      std::istringstream compile_error_lines(compile_error_text);
+      for (std::string line; std::getline(compile_error_lines, line);) {
+        if (std::smatch match; std::regex_match(line, match, diagnostic_pattern)) {
+          diagnostics.push_back(json{
+              {"file", match[1].str()},
+              {"line", std::stoul(match[2].str())},
+              {"column", std::stoul(match[3].str())},
+              {"severity", match[4].str()},
+              {"code", match[5].str()},
+              {"message", match[6].str()},
+          });
+        }
+      }
     }
 
     shaders_json.push_back(json{
@@ -4567,6 +4676,7 @@ void ProcessPendingLiveShaderRequests(
         {"removed", disk.removed},
         {"isCompilationOk", ok},
         {"compileError", compile_error},
+        {"diagnostics", diagnostics},
         {"isActiveDiskSource", details.shader_source == ShaderDetails::ShaderSource::DISK_SHADER},
         {"bytecodeSize", ok ? disk.GetCompilationData().size() : 0u},
         {"snapshotDrawCount", draw_count},
@@ -5421,7 +5531,8 @@ void ProcessPendingDeviceProxyRequests(
           {"space", slot_space.second},
           {"bufferHandle", FormatHandle(cb.buffer.handle)},
           {"offset", cb.offset},
-          {"size", cb.size},
+          {"size", cb.size == UINT64_MAX ? json(nullptr) : json(cb.size)},
+          {"fullRange", cb.size == UINT64_MAX},
       });
     }
   }
@@ -5451,6 +5562,7 @@ void ProcessPendingDeviceProxyRequests(
       .get_tracking_state = GetTrackingStateSummaryForMcp,
       .set_tracking_active = [](bool active) {
         snapshot_return_to_idle.store(false);
+        bypass_forced_tracking.store(false);  // an explicit choice wins over the bypass auto-toggle
         devkit_tracking_requested.store(active);
         return GetTrackingStateSummaryForMcp(); },
       .has_active_snapshot = []() { return snapshot_device != nullptr; },
@@ -5561,6 +5673,8 @@ void ProcessPendingDeviceProxyRequests(
             .shader_usage_entries = device_data->shader_draw_indexes.size(),
             .snapshot_rows = device_data->snapshot_rows.size(),
             .snapshot_rows_valid = device_data->snapshot_rows_valid,
+            .snapshot_capture_count = device_data->snapshot_capture_count,
+            .snapshot_captured_at_ms = device_data->snapshot_captured_at_ms,
         }; },
       .queue_snapshot = [](uint32_t device_index, std::optional<bool> return_to_idle) {
         std::shared_lock list_lock(device_data_list_mutex);
@@ -5639,6 +5753,10 @@ void RegisterDevkitMcpTools(renodx::utils::mcp::Server& server) {
       .build_output_chain_tool_context = []() { return devkit_output_chain::ToolContext{
                                                     .resolve_device_index = BuildResolveDeviceIndexCallback(),
                                                     .capture_snapshot_graph = BuildSnapshotGraphForMcp,
+                                                    .get_disassembly = [](uint32_t device_index, uint32_t shader_hash) {
+                                                      auto section = BuildMcpShaderDisassemblySection(device_index, shader_hash);
+                                                      return section.available ? std::move(section.text) : std::string();
+                                                    },
                                                 }; },
       .build_upgrade_candidates_tool_context = []() { return devkit_upgrade_candidates::ToolContext{
                                                           .resolve_device_index = BuildResolveDeviceIndexCallback(),
@@ -5873,7 +5991,120 @@ bool OnCreateSwapchain(reshade::api::swapchain_desc& desc, void* hwnd) {
   return changed;
 }
 
-[[nodiscard]] DeviceData::CachedSwapchainRuntimeInfo CaptureSwapchainRuntimeInfo(reshade::api::swapchain* swapchain) {
+// Records what the game sends through IDXGISwapChain4::SetHDRMetaData. ReShade has no event for it, so the DXGI
+// implementation is hooked once; ReShade's swapchain proxy forwards the call to it.
+namespace hdr_metadata_hook {
+using SetHdrMetaDataFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain4*, DXGI_HDR_METADATA_TYPE, UINT, void*);
+// COM ABI slot of SetHDRMetaData: IUnknown 3 + IDXGIObject 4 + DeviceSubObject 1 + SwapChain 10
+// + SwapChain1 11 + SwapChain2 7 + SwapChain3 4 = 40.
+constexpr size_t SET_HDR_METADATA_VTABLE_INDEX = 40u;
+
+struct Record {
+  std::uint64_t call_count = 0u;
+  std::int64_t last_call_ms = 0;
+  DXGI_HDR_METADATA_TYPE type = DXGI_HDR_METADATA_TYPE_NONE;
+  std::optional<DXGI_HDR_METADATA_HDR10> hdr10 = std::nullopt;
+};
+
+std::mutex mutex;
+Record record;
+SetHdrMetaDataFn original = nullptr;
+void* target = nullptr;
+std::atomic_bool install_attempted = false;
+std::string install_error;
+
+HRESULT STDMETHODCALLTYPE Detour(IDXGISwapChain4* swapchain, DXGI_HDR_METADATA_TYPE type, UINT size, void* metadata) {
+  {
+    const std::scoped_lock lock(mutex);
+    ++record.call_count;
+    record.last_call_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::system_clock::now().time_since_epoch())
+                              .count();
+    record.type = type;
+    if (type == DXGI_HDR_METADATA_TYPE_HDR10 && metadata != nullptr && size >= sizeof(DXGI_HDR_METADATA_HDR10)) {
+      record.hdr10 = *static_cast<const DXGI_HDR_METADATA_HDR10*>(metadata);
+    } else {
+      record.hdr10.reset();
+    }
+  }
+  return original(swapchain, type, size, metadata);
+}
+
+void InstallOnce(reshade::api::swapchain* swapchain) {
+  if (!renodx::utils::swapchain::IsDXGI(swapchain)) return;
+  if (install_attempted.exchange(true)) return;
+
+  auto* native = reinterpret_cast<IUnknown*>(swapchain->get_native());
+  IDXGISwapChain4* swapchain4 = nullptr;
+  if (native == nullptr || FAILED(native->QueryInterface(IID_PPV_ARGS(&swapchain4)))) {
+    const std::scoped_lock lock(mutex);
+    install_error = "IDXGISwapChain4 is not available";
+    return;
+  }
+  target = (*reinterpret_cast<void***>(swapchain4))[SET_HDR_METADATA_VTABLE_INDEX];
+  swapchain4->Release();
+
+  try {
+    const auto status = MH_Initialize();
+    if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED) {
+      throw std::runtime_error(MH_StatusToString(status));
+    }
+    const auto function = renodx::utils::minhook::Function(
+        reinterpret_cast<SetHdrMetaDataFn>(target), &Detour, &original);
+    renodx::utils::minhook::Create(function);
+    renodx::utils::minhook::Enable(function);
+  } catch (const std::exception& ex) {
+    const std::scoped_lock lock(mutex);
+    install_error = ex.what();
+    target = nullptr;
+  }
+}
+
+void Uninstall() {
+  // Redirect future calls before the module unloads; the detour lives in this DLL.
+  if (target != nullptr) {
+    MH_DisableHook(target);
+    MH_RemoveHook(target);
+    target = nullptr;
+  }
+}
+
+[[nodiscard]] json ToJson() {
+  const std::scoped_lock lock(mutex);
+  json result = {
+      {"hooked", target != nullptr},
+      {"hookError", install_error.empty() ? json(nullptr) : json(install_error)},
+      {"callCount", record.call_count},
+      {"lastCallMs", record.call_count == 0u ? json(nullptr) : json(record.last_call_ms)},
+      {"type", "none"},
+  };
+  if (record.type == DXGI_HDR_METADATA_TYPE_HDR10) result["type"] = "hdr10";
+  if (record.type == DXGI_HDR_METADATA_TYPE_HDR10PLUS) result["type"] = "hdr10plus";
+  if (record.hdr10.has_value()) {
+    const auto& m = record.hdr10.value();
+    // DXGI units: chromaticities in 1/50000, MaxMasteringLuminance in nits, MinMasteringLuminance in 1/10000 nits.
+    const auto xy = [](const UINT16 values[2]) { return json{values[0] / 50000.0, values[1] / 50000.0}; };
+    result["hdr10"] = {
+        {"redPrimary", xy(m.RedPrimary)},
+        {"greenPrimary", xy(m.GreenPrimary)},
+        {"bluePrimary", xy(m.BluePrimary)},
+        {"whitePoint", xy(m.WhitePoint)},
+        {"maxMasteringLuminanceNits", m.MaxMasteringLuminance},
+        {"minMasteringLuminanceNits", m.MinMasteringLuminance / 10000.0},
+        {"maxContentLightLevel", m.MaxContentLightLevel},
+        {"maxFrameAverageLightLevel", m.MaxFrameAverageLightLevel},
+    };
+  }
+  return result;
+}
+}  // namespace hdr_metadata_hook
+
+constexpr std::int64_t OUTPUT_DESC_REFRESH_MS = 2000;
+
+// previous: the last cached info for this swapchain; its display state is reused until it is OUTPUT_DESC_REFRESH_MS old.
+[[nodiscard]] DeviceData::CachedSwapchainRuntimeInfo CaptureSwapchainRuntimeInfo(
+    reshade::api::swapchain* swapchain,
+    const DeviceData::CachedSwapchainRuntimeInfo* previous = nullptr) {
   DeviceData::CachedSwapchainRuntimeInfo info = {};
   if (swapchain == nullptr) return info;
   info.color_space = swapchain->get_color_space();
@@ -5885,6 +6116,20 @@ bool OnCreateSwapchain(reshade::api::swapchain_desc& desc, void* hwnd) {
     if (bb.handle != 0u) {
       info.backbuffer_handles.push_back(bb.handle);
     }
+  }
+
+  const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch())
+                          .count();
+  if (previous != nullptr && previous->output_desc_queried_ms != 0
+      && now_ms - previous->output_desc_queried_ms < OUTPUT_DESC_REFRESH_MS) {
+    info.output_desc = previous->output_desc;
+    info.output_desc_queried_ms = previous->output_desc_queried_ms;
+  } else {
+    if (renodx::utils::swapchain::IsDXGI(swapchain)) {
+      info.output_desc = renodx::utils::swapchain::GetDirectXOutputDesc1(swapchain);
+    }
+    info.output_desc_queried_ms = now_ms;
   }
   return info;
 }
@@ -5932,6 +6177,7 @@ void OnInitSwapchain(reshade::api::swapchain* swapchain, bool resize) {
   }
 
   const bool is_flip = IsFlipSwapchainPresentMode(tracked_desc.present_mode);
+  hdr_metadata_hook::InstallOnce(swapchain);
   auto runtime_info = CaptureSwapchainRuntimeInfo(swapchain);
   {
     const std::unique_lock lock(device_data->mutex);
@@ -6445,7 +6691,7 @@ void OnPushDescriptors(
   }
 }
 
-bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_method) {
+bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_method, uint32_t element_count = 0u) {
   bool bypass_draw = false;
 
   auto* device = cmd_list->get_device();
@@ -6557,6 +6803,8 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
       draw_details.uav_binds = command_list_data->pixel_uav_binds;
     }
     draw_details.blend_desc = command_list_data->blend_desc;
+    draw_details.viewport = command_list_data->viewport;
+    draw_details.element_count = element_count;
 
     std::unique_lock lock(device_data->mutex);
     struct CachedResourceViewDetails {
@@ -6895,7 +7143,14 @@ bool OnDraw(
     uint32_t instance_count,
     uint32_t first_vertex,
     uint32_t first_instance) {
-  return OnDraw(cmd_list, DrawDetails::DrawMethods::DRAW);
+  return OnDraw(cmd_list, DrawDetails::DrawMethods::DRAW, vertex_count);
+}
+
+void OnBindViewports(reshade::api::command_list* cmd_list, uint32_t first, uint32_t count, const reshade::api::viewport* viewports) {
+  if (first != 0u || count == 0u || viewports == nullptr) return;
+  if (auto* data = renodx::utils::data::Get<CommandListData>(cmd_list); data != nullptr) {
+    data->viewport = viewports[0];
+  }
 }
 
 bool OnDispatch(reshade::api::command_list* cmd_list, uint32_t group_count_x, uint32_t group_count_y, uint32_t group_count_z) {
@@ -6909,7 +7164,7 @@ bool OnDrawIndexed(
     uint32_t first_index,
     int32_t vertex_offset,
     uint32_t first_instance) {
-  return OnDraw(cmd_list, DrawDetails::DrawMethods::DRAW_INDEXED);
+  return OnDraw(cmd_list, DrawDetails::DrawMethods::DRAW_INDEXED, index_count);
 }
 
 bool OnDrawOrDispatchIndirect(
@@ -7018,6 +7273,7 @@ void RenderMenuBar(reshade::api::device* device, DeviceData* data) {
         ImGuiCol_Text,
         is_tracking_active ? ImVec4(0.35f, 0.95f, 0.45f, 1.0f) : ImVec4(1.0f, 0.65f, 0.25f, 1.0f));
     if (ImGui::MenuItem(is_tracking_active ? "DevKit: Active" : "DevKit: Idle")) {
+      bypass_forced_tracking.store(false);
       devkit_tracking_requested.store(!is_tracking_active);
     }
     ImGui::PopStyleColor();
@@ -8856,8 +9112,7 @@ void RenderShadersPane(reshade::api::device* device, DeviceData* data) {
                           })
                           + (ImGui::GetStyle().FramePadding.x * 2);
         if (ImGui::Button("Draw", {text_size, 0})) {
-          shader_details->bypass_draw = !shader_details->bypass_draw;
-          skip_draw_count += shader_details->bypass_draw ? +1 : -1;
+          SetShaderDrawBypass(*shader_details, !shader_details->bypass_draw);
         }
         ImGui::PopStyleColor();
 
@@ -10257,7 +10512,13 @@ void RenderResourceView(reshade::api::device* device, DeviceData* data, SettingS
 }
 
 void RenderConstantBufferViewPreview(reshade::api::device* device, DeviceData* data, uint64_t constant_buffer_handle) {
-  auto details = device->get_resource_desc({constant_buffer_handle});
+  // The handle comes from a snapshot and may be freed by now; never query the API with it.
+  reshade::api::resource_desc details = {};
+  if (constant_buffer_handle == 0u
+      || !renodx::utils::resource::GetLiveResourceInfo({constant_buffer_handle}, [&details](const auto& info) { details = info.desc; })) {
+    ImGui::TextDisabled("Constant buffer was destroyed since the snapshot.");
+    return;
+  }
 
   if (details.type == reshade::api::resource_type::buffer) {
     auto data = renodx::utils::constants::GetResourceCache(device, {constant_buffer_handle});
@@ -10749,6 +11010,7 @@ void SetDevkitTrackingActive(bool active) {
     reshade::register_event<reshade::addon_event::copy_texture_region>(OnCopyTextureRegion);
     reshade::register_event<reshade::addon_event::push_constants>(OnPushConstants);
     reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
+    reshade::register_event<reshade::addon_event::bind_viewports>(OnBindViewports);
     reshade::register_event<reshade::addon_event::draw>(OnDraw);
     reshade::register_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
     reshade::register_event<reshade::addon_event::draw_or_dispatch_indirect>(OnDrawOrDispatchIndirect);
@@ -10763,6 +11025,7 @@ void SetDevkitTrackingActive(bool active) {
     reshade::unregister_event<reshade::addon_event::copy_texture_region>(OnCopyTextureRegion);
     reshade::unregister_event<reshade::addon_event::push_constants>(OnPushConstants);
     reshade::unregister_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
+    reshade::unregister_event<reshade::addon_event::bind_viewports>(OnBindViewports);
     reshade::unregister_event<reshade::addon_event::draw>(OnDraw);
     reshade::unregister_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
     reshade::unregister_event<reshade::addon_event::draw_or_dispatch_indirect>(OnDrawOrDispatchIndirect);
@@ -10811,7 +11074,11 @@ void OnPresent(
       && snapshot_device == nullptr
       && snapshot_queued_device == nullptr) {
     trace_return_to_idle.store(false);
-    devkit_tracking_requested.store(false);
+    if (skip_draw_count.load() == 0u) {
+      devkit_tracking_requested.store(false);
+    } else {
+      bypass_forced_tracking.store(true);  // return to Idle once the last bypass goes away
+    }
   }
   if (const bool requested = devkit_tracking_requested.load(); requested != devkit_tracking_active.load()) {
     SetDevkitTrackingActive(requested);
@@ -10835,7 +11102,16 @@ void OnPresent(
         device_index = static_cast<uint32_t>(std::distance(device_data_list.begin(), iterator));
       }
     }
-    auto swapchain_runtime_info = CaptureSwapchainRuntimeInfo(swapchain);
+    // Copy the previous entry out so no DXGI call runs under device_data->mutex (see the ABBA deadlock fix).
+    std::optional<DeviceData::CachedSwapchainRuntimeInfo> previous_runtime_info;
+    {
+      std::shared_lock device_lock(device_data->mutex);
+      if (const auto it = device_data->swapchain_runtime_info.find(swapchain); it != device_data->swapchain_runtime_info.end()) {
+        previous_runtime_info = it->second;
+      }
+    }
+    auto swapchain_runtime_info = CaptureSwapchainRuntimeInfo(
+        swapchain, previous_runtime_info.has_value() ? &previous_runtime_info.value() : nullptr);
     std::deque<std::shared_ptr<devkit_resource_analysis::PendingRequest>> pending_requests;
     {
       std::unique_lock device_lock(device_data->mutex);
@@ -10972,6 +11248,10 @@ void OnPresent(
     snapshot_device = nullptr;
     auto* device_data = get_data();
     std::unique_lock lock(device_data->mutex);
+    ++device_data->snapshot_capture_count;
+    device_data->snapshot_captured_at_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                               std::chrono::system_clock::now().time_since_epoch())
+                                               .count();
     std::ranges::sort(device_data->draw_details_list, [](const DrawDetails& a, const DrawDetails& b) {
       const bool a_unknown_submission = a.submission_order == 0u;
       const bool b_unknown_submission = b.submission_order == 0u;
@@ -11016,9 +11296,14 @@ void OnPresent(
     device_data->snapshot_row_layout_key = 0u;
     device_data->snapshot_rows_valid = false;
     lock.unlock();
+    // Active bypasses need the draw hooks; stay active until the last one is removed.
     if (snapshot_return_to_idle.exchange(false)) {
-      devkit_tracking_requested.store(false);
-      SetDevkitTrackingActive(false);
+      if (skip_draw_count.load() == 0u) {
+        devkit_tracking_requested.store(false);
+        SetDevkitTrackingActive(false);
+      } else {
+        bypass_forced_tracking.store(true);  // return to Idle once the last bypass goes away
+      }
     }
   }
 }
@@ -11090,6 +11375,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
     case DLL_PROCESS_DETACH:
       devkit_mcp_server_session::Stop(devkit_mcp_session);
       SetDevkitTrackingActive(false);
+      hdr_metadata_hook::Uninstall();
 
       renodx::utils::trace::Use(fdw_reason);
       renodx::utils::constants::Use(fdw_reason);

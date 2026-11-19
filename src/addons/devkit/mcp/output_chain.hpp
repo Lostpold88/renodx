@@ -6,11 +6,14 @@
 #pragma once
 
 #include <algorithm>
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <format>
 #include <functional>
+#include <initializer_list>
+#include <map>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -76,8 +79,10 @@ struct DrawNode {
   std::optional<std::string> active_shader_stage = std::nullopt;
   std::vector<std::string> shader_hashes;
   bool blend_enabled = false;
+  bool additive_blend = false;
   bool writes_backbuffer = false;
   bool is_fullscreen_pass = false;
+  std::uint32_t element_count = 0u;
   std::vector<ResourceEndpoint> inputs;
   std::vector<ResourceEndpoint> outputs;
 };
@@ -89,8 +94,10 @@ struct ChainPassEntry {
   std::optional<std::string> active_shader_stage = std::nullopt;
   std::vector<std::string> shader_hashes;
   bool blend_enabled = false;
+  bool additive_blend = false;
   bool writes_backbuffer = false;
   bool is_fullscreen_pass = false;
+  std::uint32_t element_count = 0u;
   std::vector<std::uint32_t> upstream_draw_indices;
   std::vector<ResourceEndpoint> inputs;
   std::vector<ResourceEndpoint> outputs;
@@ -105,8 +112,10 @@ inline void to_json(json& j, const ChainPassEntry& value) {
       {"activeShaderStage", value.active_shader_stage.has_value() ? json(value.active_shader_stage.value()) : json(nullptr)},
       {"shaderHashes", value.shader_hashes},
       {"blendEnabled", value.blend_enabled},
+      {"additiveBlend", value.additive_blend},
       {"writesBackbuffer", value.writes_backbuffer},
       {"isFullscreenPass", value.is_fullscreen_pass},
+      {"elementCount", value.element_count},
       {"upstreamDrawIndices", value.upstream_draw_indices},
       {"inputs", value.inputs},
       {"outputs", value.outputs},
@@ -146,6 +155,7 @@ struct UiDrawEntry {
   std::vector<std::string> shader_hashes;
   bool blend_enabled = false;
   bool is_fullscreen_pass = false;
+  std::uint32_t element_count = 0u;
 };
 
 // NOLINTNEXTLINE(readability-identifier-naming)
@@ -156,6 +166,7 @@ inline void to_json(json& j, const UiDrawEntry& value) {
       {"shaderHashes", value.shader_hashes},
       {"blendEnabled", value.blend_enabled},
       {"isFullscreenPass", value.is_fullscreen_pass},
+      {"elementCount", value.element_count},
   };
 }
 
@@ -180,6 +191,8 @@ struct TraceResult {
 struct ToolContext {
   std::function<std::uint32_t(const json& arguments)> resolve_device_index;
   std::function<SnapshotGraph(std::uint32_t device_index)> capture_snapshot_graph;
+  // Disassembly text of a tracked shader; empty when unavailable. Lets classification inspect shader code.
+  std::function<std::string(std::uint32_t device_index, std::uint32_t shader_hash)> get_disassembly;
 };
 
 [[nodiscard]] inline TraceResult TraceOutputChain(
@@ -217,7 +230,8 @@ struct ToolContext {
     if (writes_bb) {
       backbuffer_writer_indices.push_back(draw.draw_index);
       const bool is_copy_method = (draw.method == "Copy" || draw.method == "CopyResource" || draw.method == "CopyTextureRegion");
-      if (is_copy_method || (draw.is_fullscreen_pass && !draw.blend_enabled)) {
+      // A fullscreen post pass is a single quad/triangle (<= 6 elements) or a compute dispatch (0); UI batches are larger.
+      if (is_copy_method || (draw.is_fullscreen_pass && !draw.blend_enabled && draw.element_count <= 6u)) {
         last_opaque_fullscreen_backbuffer_draw = draw.draw_index;
       }
     }
@@ -242,6 +256,7 @@ struct ToolContext {
             .shader_hashes = ui_draw.shader_hashes,
             .blend_enabled = ui_draw.blend_enabled,
             .is_fullscreen_pass = ui_draw.is_fullscreen_pass,
+            .element_count = ui_draw.element_count,
         });
       }
     }
@@ -334,8 +349,10 @@ struct ToolContext {
         .active_shader_stage = draw.active_shader_stage,
         .shader_hashes = draw.shader_hashes,
         .blend_enabled = draw.blend_enabled,
+        .additive_blend = draw.additive_blend,
         .writes_backbuffer = draw.writes_backbuffer,
         .is_fullscreen_pass = draw.is_fullscreen_pass,
+        .element_count = draw.element_count,
         .upstream_draw_indices = std::move(upstream_list),
         .inputs = draw.inputs,
         .outputs = draw.outputs,
@@ -524,6 +541,42 @@ struct ToolContext {
       }
     }
 
+    // Shader code evidence from the disassembly (decimal float literals, so prefixes tolerate rounding).
+    bool has_pq_constants = false;
+    bool looks_like_cas = false;
+    if (context.get_disassembly && !is_copy && pass.depth_from_output <= 2u) {
+      for (const auto& hash_text : pass.shader_hashes) {
+        std::uint32_t shader_hash = 0u;
+        if (!hash_text.starts_with("0x")
+            || std::from_chars(hash_text.data() + 2, hash_text.data() + hash_text.size(), shader_hash, 16).ec != std::errc{}) {
+          continue;
+        }
+        const auto disassembly = context.get_disassembly(device_index, shader_hash);
+        const auto count_of = [&disassembly](std::initializer_list<std::string_view> needles) {
+          std::size_t count = 0u;
+          for (const auto needle : needles) {
+            for (auto pos = disassembly.find(needle); pos != std::string::npos; pos = disassembly.find(needle, pos + needle.size())) {
+              ++count;
+            }
+          }
+          return count;
+        };
+        // ST 2084 constants m1 = 0.1593017578125, m2 = 78.84375, c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875.
+        std::size_t pq_constant_hits = 0u;
+        for (const auto* const constant : {"0.1593", "78.84", "0.8359", "18.85", "18.68"}) {
+          if (disassembly.find(constant) != std::string::npos) {
+            ++pq_constant_hits;
+          }
+        }
+        has_pq_constants = has_pq_constants || pq_constant_hits >= 4u;
+        // AMD CAS: a 5..9 tap neighborhood combined with min/max clamping and a reciprocal.
+        const auto tap_count = count_of({"sample_", "sample ", "ld_", "ld ", "gather4", "OpImageSample", "OpImageFetch", "OpImageGather"});
+        looks_like_cas = looks_like_cas
+                         || (tap_count >= 5u && tap_count <= 9u && count_of({"min ", "FMin", "NMin"}) > 0u
+                             && count_of({"max ", "FMax", "NMax"}) > 0u && count_of({"rcp ", "OpFDiv"}) > 0u);
+      }
+    }
+
     bool writes_unorm = false;
     bool writes_float_subres = false;
     bool writes_hdr10_bb = false;
@@ -548,6 +601,15 @@ struct ToolContext {
       }
     }
 
+    if (has_pq_constants) {
+      roles.emplace_back("pq_encode");
+      evidence.emplace_back("shader contains SMPTE ST 2084 PQ constants");
+    }
+    if (looks_like_cas) {
+      roles.emplace_back("sharpen_cas");
+      evidence.emplace_back("5-9 texture taps with min/max clamping and a reciprocal (contrast adaptive sharpening)");
+    }
+
     if (writes_hdr10_bb) {
       roles.emplace_back("hdr10_output");
       evidence.emplace_back("writes HDR10 PQ/HLG backbuffer");
@@ -562,9 +624,17 @@ struct ToolContext {
     if (reads_lut) {
       roles.emplace_back("lut_or_color_grade");
     }
-    if (writes_float_subres || (reads_subres_float && !reads_float_fullres && !writes_hdr10_bb && !writes_sdr_bb)) {
+    const bool is_subres_float_pass =
+        writes_float_subres || (reads_subres_float && !reads_float_fullres && !writes_hdr10_bb && !writes_sdr_bb);
+    const bool is_fullscreen_additive = pass.additive_blend && pass.is_fullscreen_pass;
+    if (is_subres_float_pass || is_fullscreen_additive) {
       roles.emplace_back("bloom_or_blur_pyramid");
+    }
+    if (is_subres_float_pass) {
       evidence.emplace_back("operates on half/quarter-res float target");
+    }
+    if (is_fullscreen_additive) {
+      evidence.emplace_back("fullscreen additive blend (destination factor one)");
     }
     if (!is_copy && (reads_lut || (reads_float_fullres && writes_unorm) || (reads_float_fullres && reads_subres_float))) {
       roles.emplace_back("tonemap_or_grade_candidate");
@@ -596,6 +666,23 @@ struct ToolContext {
         {"isFullscreenPass", pass.is_fullscreen_pass},
         {"blendEnabled", pass.blend_enabled},
     });
+  }
+
+  // UI draws are numerous; report one ui_hud entry per distinct shader set instead of one per draw.
+  std::map<std::vector<std::string>, json> ui_groups;
+  for (const auto& ui_draw : trace.ui_draws) {
+    auto& group = ui_groups.try_emplace(ui_draw.shader_hashes, json{
+                                                                   {"firstDrawIndex", ui_draw.draw_index},
+                                                                   {"shaderHashes", ui_draw.shader_hashes},
+                                                                   {"roles", json::array({"ui_hud"})},
+                                                                   {"drawCount", 0u},
+                                                               }).first->second;
+    group["drawCount"] = group["drawCount"].get<std::uint32_t>() + 1u;
+    group["lastDrawIndex"] = ui_draw.draw_index;
+  }
+  for (const auto& [shader_hashes, group] : ui_groups) {
+    (void)shader_hashes;
+    classified_passes.push_back(group);
   }
 
   json result = {
