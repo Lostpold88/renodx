@@ -365,23 +365,6 @@ static bool RevertBufferRange(
   return true;
 }
 
-inline void SetCaptureEnabled(bool capture_cb, bool capture_pd) {
-  if (shared.data != nullptr) {
-    shared.data->capture_constant_buffers = capture_cb;
-    shared.data->capture_push_descriptors = capture_pd;
-  }
-  shared.RegisterEvent<reshade::addon_event::init_command_list>(OnInitCommandList, capture_pd);
-  shared.RegisterEvent<reshade::addon_event::destroy_command_list>(OnDestroyCommandList, capture_pd);
-  shared.RegisterEvent<reshade::addon_event::push_descriptors>(OnPushDescriptors, capture_pd);
-
-  shared.RegisterEvent<reshade::addon_event::init_resource>(OnInitResource, capture_cb);
-  shared.RegisterEvent<reshade::addon_event::destroy_resource>(OnDestroyResource, capture_cb);
-  shared.RegisterEvent<reshade::addon_event::push_constants>(OnPushConstants, capture_cb);
-  shared.RegisterEvent<reshade::addon_event::map_buffer_region>(OnMapBufferRegion, capture_cb);
-  shared.RegisterEvent<reshade::addon_event::unmap_buffer_region>(OnUnmapBufferRegion, capture_cb);
-  shared.RegisterEvent<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion, capture_cb);
-}
-
 static void Use(DWORD fdw_reason) {
   switch (fdw_reason) {
     case DLL_PROCESS_ATTACH:

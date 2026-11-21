@@ -13,26 +13,18 @@
 
 #include "../../../utils/mcp/server.hpp"
 #include "../../../utils/mcp/arguments.hpp"
-#include "deep_analysis.hpp"
-#include "device_proxy.hpp"
 #include "live_shaders.hpp"
-#include "output_chain.hpp"
 #include "resource_analysis.hpp"
 #include "resource_clone.hpp"
 #include "shader_inspection.hpp"
 #include "snapshot_tools.hpp"
 #include "texture_replace.hpp"
 #include "tool_catalog.hpp"
-#include "upgrade_candidates.hpp"
 
 namespace renodx::addons::devkit::mcp::runtime {
 
 struct RegistrationContext {
   std::function<snapshot_tools::ToolContext()> build_snapshot_tools_context;
-  std::function<output_chain::ToolContext()> build_output_chain_tool_context;
-  std::function<upgrade_candidates::ToolContext()> build_upgrade_candidates_tool_context;
-  std::function<device_proxy::ToolContext()> build_device_proxy_tool_context;
-  std::function<deep_analysis::ToolContext()> build_deep_analysis_tool_context;
   std::function<shader_inspection::ToolContext()> build_shader_inspection_tool_context;
   std::function<live_shaders::ToolContext()> build_live_shaders_tool_context;
   std::function<resource_analysis::ToolContext()> build_analyze_resource_tool_context;
@@ -64,22 +56,6 @@ inline void RegisterTools(renodx::utils::mcp::Server& server, const Registration
   register_tool("devkit_status", [build_snapshot_tools_context = context.build_snapshot_tools_context](
                                       const renodx::utils::mcp::json& arguments) {
     return snapshot_tools::HandleStatusTool(arguments, build_snapshot_tools_context());
-  });
-  register_tool("devkit_set_tracking_active", [build_snapshot_tools_context = context.build_snapshot_tools_context](
-                                                  const renodx::utils::mcp::json& arguments) {
-    return snapshot_tools::HandleSetTrackingActiveTool(arguments, build_snapshot_tools_context());
-  });
-  register_tool("devkit_get_swapchain_info", [build_snapshot_tools_context = context.build_snapshot_tools_context](
-                                                 const renodx::utils::mcp::json& arguments) {
-    return snapshot_tools::HandleGetSwapchainInfoTool(arguments, build_snapshot_tools_context());
-  });
-  register_tool("devkit_list_resources", [build_snapshot_tools_context = context.build_snapshot_tools_context](
-                                             const renodx::utils::mcp::json& arguments) {
-    return snapshot_tools::HandleListResourcesTool(arguments, build_snapshot_tools_context());
-  });
-  register_tool("devkit_set_shader_bypass", [build_snapshot_tools_context = context.build_snapshot_tools_context](
-                                                const renodx::utils::mcp::json& arguments) {
-    return snapshot_tools::HandleSetShaderBypassTool(arguments, build_snapshot_tools_context());
   });
   register_tool("devkit_select_device", [build_snapshot_tools_context = context.build_snapshot_tools_context](
                                              const renodx::utils::mcp::json& arguments) {
@@ -113,10 +89,6 @@ inline void RegisterTools(renodx::utils::mcp::Server& server, const Registration
                                                   const renodx::utils::mcp::json& arguments) {
     return live_shaders::HandleUnloadLiveShadersTool(arguments, build_live_shaders_tool_context());
   });
-  register_tool("devkit_get_live_shader_status", [build_live_shaders_tool_context = context.build_live_shaders_tool_context](
-                                                     const renodx::utils::mcp::json& arguments) {
-    return live_shaders::HandleGetLiveShaderStatusTool(arguments, build_live_shaders_tool_context());
-  });
   register_tool("devkit_list_draws", [build_snapshot_tools_context = context.build_snapshot_tools_context](
                                           const renodx::utils::mcp::json& arguments) {
     return snapshot_tools::HandleListDrawsTool(arguments, build_snapshot_tools_context());
@@ -125,25 +97,9 @@ inline void RegisterTools(renodx::utils::mcp::Server& server, const Registration
                                         const renodx::utils::mcp::json& arguments) {
     return snapshot_tools::HandleGetDrawTool(arguments, build_snapshot_tools_context());
   });
-  register_tool("devkit_get_draw_constants", [build_deep_analysis_tool_context = context.build_deep_analysis_tool_context](
-                                                 const renodx::utils::mcp::json& arguments) {
-    return deep_analysis::HandleGetDrawConstantsTool(arguments, build_deep_analysis_tool_context());
-  });
-  register_tool("devkit_diff_draw_constants", [build_deep_analysis_tool_context = context.build_deep_analysis_tool_context](
-                                                  const renodx::utils::mcp::json& arguments) {
-    return deep_analysis::HandleDiffDrawConstantsTool(arguments, build_deep_analysis_tool_context());
-  });
-  register_tool("devkit_compare_resource_ab", [build_analyze_resource_tool_context = context.build_analyze_resource_tool_context](
-                                                  const renodx::utils::mcp::json& arguments) {
-    return resource_analysis::HandleCompareResourceAbTool(arguments, build_analyze_resource_tool_context());
-  });
   register_tool("devkit_analyze_resource", [build_analyze_resource_tool_context = context.build_analyze_resource_tool_context](
                                                const renodx::utils::mcp::json& arguments) {
     return resource_analysis::HandleAnalyzeResourceTool(arguments, build_analyze_resource_tool_context());
-  });
-  register_tool("devkit_analyze_lut", [build_analyze_resource_tool_context = context.build_analyze_resource_tool_context](
-                                          const renodx::utils::mcp::json& arguments) {
-    return resource_analysis::HandleAnalyzeLutTool(arguments, build_analyze_resource_tool_context());
   });
   register_tool("devkit_dump_resource_with_hash", [build_analyze_resource_tool_context = context.build_analyze_resource_tool_context](
                                                        const renodx::utils::mcp::json& arguments) {
@@ -192,41 +148,6 @@ inline void RegisterTools(renodx::utils::mcp::Server& server, const Registration
   register_tool("devkit_queue_snapshot", [build_snapshot_tools_context = context.build_snapshot_tools_context](
                                              const renodx::utils::mcp::json& arguments) {
     return snapshot_tools::HandleQueueSnapshotTool(arguments, build_snapshot_tools_context());
-  });
-  register_tool("devkit_trace_output_chain", [build_output_chain_tool_context = context.build_output_chain_tool_context](
-                                                 const renodx::utils::mcp::json& arguments) {
-    return output_chain::HandleTraceOutputChainTool(arguments, build_output_chain_tool_context());
-  });
-  register_tool("devkit_classify_postprocess", [build_output_chain_tool_context = context.build_output_chain_tool_context](
-                                                   const renodx::utils::mcp::json& arguments) {
-    return output_chain::HandleClassifyPostprocessTool(arguments, build_output_chain_tool_context());
-  });
-  register_tool("devkit_scan_pass_resources", [build_analyze_resource_tool_context = context.build_analyze_resource_tool_context](
-                                                  const renodx::utils::mcp::json& arguments) {
-    return resource_analysis::HandleScanPassResourcesTool(arguments, build_analyze_resource_tool_context());
-  });
-  register_tool("devkit_compare_snapshots", [build_deep_analysis_tool_context = context.build_deep_analysis_tool_context](
-                                                const renodx::utils::mcp::json& arguments) {
-    return deep_analysis::HandleCompareSnapshotsTool(arguments, build_deep_analysis_tool_context());
-  });
-  register_tool("devkit_queue_trace", [build_deep_analysis_tool_context = context.build_deep_analysis_tool_context](
-                                          const renodx::utils::mcp::json& arguments) {
-    return deep_analysis::HandleQueueTraceTool(arguments, build_deep_analysis_tool_context());
-  });
-  register_tool("devkit_get_trace_log", [](const renodx::utils::mcp::json& arguments) {
-    return deep_analysis::HandleGetTraceLogTool(arguments);
-  });
-  register_tool("devkit_get_device_proxy_state", [build_device_proxy_tool_context = context.build_device_proxy_tool_context](
-                                                     const renodx::utils::mcp::json& arguments) {
-    return device_proxy::HandleGetDeviceProxyStateTool(arguments, build_device_proxy_tool_context());
-  });
-  register_tool("devkit_set_device_proxy_mode", [build_device_proxy_tool_context = context.build_device_proxy_tool_context](
-                                                    const renodx::utils::mcp::json& arguments) {
-    return device_proxy::HandleSetDeviceProxyModeTool(arguments, build_device_proxy_tool_context());
-  });
-  register_tool("devkit_check_upgrade_candidates", [build_upgrade_candidates_tool_context = context.build_upgrade_candidates_tool_context](
-                                                       const renodx::utils::mcp::json& arguments) {
-    return upgrade_candidates::HandleCheckUpgradeCandidatesTool(arguments, build_upgrade_candidates_tool_context());
   });
 }
 

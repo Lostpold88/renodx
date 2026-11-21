@@ -28,7 +28,6 @@ struct ToolContext {
   std::function<ToolResult(const std::optional<std::string>& live_path)> set_live_shader_path;
   std::function<ToolResult(std::uint32_t device_index)> load_live_shaders;
   std::function<ToolResult(std::uint32_t device_index)> unload_live_shaders;
-  std::function<ToolResult(std::uint32_t device_index)> get_live_shader_status;
 };
 
 inline ToolResult HandleDumpShaderTool(const json& arguments, const ToolContext& context) {
@@ -65,14 +64,6 @@ inline ToolResult HandleUnloadLiveShadersTool(const json& arguments, const ToolC
   }
 
   return context.unload_live_shaders(context.resolve_device_index(arguments));
-}
-
-inline ToolResult HandleGetLiveShaderStatusTool(const json& arguments, const ToolContext& context) {
-  if (!context.resolve_device_index || !context.get_live_shader_status) {
-    throw std::runtime_error("The live shader tool context is not configured.");
-  }
-
-  return context.get_live_shader_status(context.resolve_device_index(arguments));
 }
 
 }  // namespace renodx::addons::devkit::mcp::live_shaders

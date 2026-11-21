@@ -161,17 +161,12 @@ inline void to_json(json& value, const ToolCallContent& content) {
 
 // NOLINTNEXTLINE(readability-identifier-naming)
 inline void to_json(json& value, const ToolCallResponse& response) {
-  std::string text = response.text.empty()
-                         ? (response.is_error ? "Tool call failed." : "Tool call completed.")
-                         : response.text;
-  if (!response.structured_content.is_null()) {
-    text += "\n\n";
-    text += response.structured_content.dump();
-  }
   value = {
       {"content", std::vector<ToolCallContent>{
                       {
-                          .text = std::move(text),
+                          .text = response.text.empty()
+                                      ? (response.is_error ? "Tool call failed." : "Tool call completed.")
+                                      : response.text,
                       },
                   }},
       {"isError", response.is_error},

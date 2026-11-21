@@ -807,18 +807,6 @@ static void OnPresent(
 }
 }  // namespace internal
 
-inline bool enable_render_pass_events_on_attach = true;
-
-inline void SetRenderPassEventsEnabled(bool enabled) {
-  if (!internal::attached) return;
-  internal::shared.RegisterEvent<reshade::addon_event::bind_render_targets_and_depth_stencil>(
-      internal::OnBindRenderTargetsAndDepthStencil, enabled);
-  internal::shared.RegisterEvent<reshade::addon_event::begin_render_pass>(
-      internal::OnBeginRenderPass, enabled);
-  internal::shared.RegisterEvent<reshade::addon_event::end_render_pass>(
-      internal::OnEndRenderPass, enabled);
-}
-
 static void Use(DWORD fdw_reason) {
   renodx::utils::resource::Use(fdw_reason);
   switch (fdw_reason) {
@@ -837,7 +825,9 @@ static void Use(DWORD fdw_reason) {
       internal::shared.RegisterEvent<reshade::addon_event::destroy_effect_runtime>(internal::OnDestroyEffectRuntime);
       internal::shared.RegisterEvent<reshade::addon_event::init_command_list>(internal::OnInitCommandList);
       internal::shared.RegisterEvent<reshade::addon_event::destroy_command_list>(internal::OnDestroyCommandList);
-      SetRenderPassEventsEnabled(enable_render_pass_events_on_attach);
+      internal::shared.RegisterEvent<reshade::addon_event::bind_render_targets_and_depth_stencil>(internal::OnBindRenderTargetsAndDepthStencil);
+      internal::shared.RegisterEvent<reshade::addon_event::begin_render_pass>(internal::OnBeginRenderPass);
+      internal::shared.RegisterEvent<reshade::addon_event::end_render_pass>(internal::OnEndRenderPass);
       reshade::register_event<reshade::addon_event::present>(internal::OnPresent);
       break;
     case DLL_PROCESS_DETACH:

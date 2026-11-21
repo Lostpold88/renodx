@@ -76,8 +76,6 @@ struct DeviceSummary {
   std::size_t resource_usage_entries = 0u;
   bool snapshot_queued = false;
   bool snapshot_active = false;
-  std::uint32_t snapshot_capture_count = 0u;
-  std::int64_t snapshot_captured_at_ms = 0;
   std::optional<PrimarySwapchainSummary> primary_swapchain = std::nullopt;
 };
 
@@ -98,9 +96,6 @@ inline void to_json(json& j, const DeviceSummary& value) {
       {"resourceUsageEntries", value.resource_usage_entries},
       {"snapshotQueued", value.snapshot_queued},
       {"snapshotActive", value.snapshot_active},
-      // snapshotRows* describe the overlay's row cache; these describe the capture itself.
-      {"snapshotCaptureCount", value.snapshot_capture_count},
-      {"snapshotCapturedAtMs", value.snapshot_captured_at_ms == 0 ? json(nullptr) : json(value.snapshot_captured_at_ms)},
   };
   if (value.primary_swapchain.has_value()) {
     j["primarySwapchain"] = value.primary_swapchain.value();

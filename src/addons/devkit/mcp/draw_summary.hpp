@@ -159,22 +159,10 @@ struct DrawSummary {
   std::size_t constant_count = 0u;
   std::size_t render_target_count = 0u;
   std::size_t pipeline_count = 0u;
-  bool blend_enabled = false;
-  // Blending with destination factor `one` on the first target (bloom, glow and light accumulation).
-  bool additive_blend = false;
-  bool writes_backbuffer = false;
-  bool is_fullscreen_pass = false;
-  // Vertex count (draw) or index count (draw_indexed); 0 when unknown (dispatch, indirect, copy).
-  std::uint32_t element_count = 0u;
-  // First bound viewport and the share of the render target it covers (0..1), when known.
-  std::optional<std::array<float, 4>> viewport = std::nullopt;
-  std::optional<float> viewport_coverage = std::nullopt;
   std::vector<std::string> shader_hashes;
   std::optional<std::string> copy_source_handle = std::nullopt;
   std::optional<std::string> copy_destination_handle = std::nullopt;
   std::optional<std::string> active_shader_stage = std::nullopt;
-  // Why descriptor bindings are or are not resolved ("ok" or the first reason tracking was skipped).
-  std::string descriptor_tracking_status;
   std::optional<std::vector<SlotResourceBindingSummary>> srv_bindings = std::nullopt;
   std::optional<std::vector<SlotResourceBindingSummary>> uav_bindings = std::nullopt;
   std::optional<std::vector<ConstantBufferSummary>> constant_buffers = std::nullopt;
@@ -195,13 +183,6 @@ inline void to_json(json& j, const DrawSummary& value) {
       {"constantCount", value.constant_count},
       {"renderTargetCount", value.render_target_count},
       {"pipelineCount", value.pipeline_count},
-      {"blendEnabled", value.blend_enabled},
-      {"additiveBlend", value.additive_blend},
-      {"writesBackbuffer", value.writes_backbuffer},
-      {"isFullscreenPass", value.is_fullscreen_pass},
-      {"elementCount", value.element_count},
-      {"viewport", value.viewport.has_value() ? json(value.viewport.value()) : json(nullptr)},
-      {"viewportCoverage", value.viewport_coverage.has_value() ? json(value.viewport_coverage.value()) : json(nullptr)},
       {"shaderHashes", value.shader_hashes},
   };
   if (value.copy_source_handle.has_value()) {
@@ -212,9 +193,6 @@ inline void to_json(json& j, const DrawSummary& value) {
   }
   if (value.active_shader_stage.has_value()) {
     j["activeShaderStage"] = value.active_shader_stage.value();
-  }
-  if (!value.descriptor_tracking_status.empty()) {
-    j["descriptorTrackingStatus"] = value.descriptor_tracking_status;
   }
   if (value.srv_bindings.has_value()) {
     j["srvBindings"] = value.srv_bindings.value();

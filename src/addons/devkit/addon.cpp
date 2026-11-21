@@ -28,7 +28,6 @@
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <regex>
 #include <shared_mutex>
 #include <span>
 #include <sstream>
@@ -53,7 +52,6 @@
 #include "../../utils/format.hpp"
 #include "../../utils/icons.hpp"
 #include "../../utils/mcp/server.hpp"
-#include "../../utils/minhook.hpp"
 #include "../../utils/path.hpp"
 #include "../../utils/pipeline.hpp"
 #include "../../utils/pipeline_layout.hpp"
@@ -71,13 +69,10 @@
 #include "../../utils/swapchain.hpp"
 #include "../../utils/trace.hpp"
 #include "./formatting.hpp"
-#include "./mcp/deep_analysis.hpp"
-#include "./mcp/device_proxy.hpp"
 #include "./mcp/device_selection.hpp"
 #include "./mcp/device_summary.hpp"
 #include "./mcp/draw_summary.hpp"
 #include "./mcp/live_shaders.hpp"
-#include "./mcp/output_chain.hpp"
 #include "./mcp/resource_analysis.hpp"
 #include "./mcp/resource_clone.hpp"
 #include "./mcp/resource_view_summary.hpp"
@@ -87,7 +82,6 @@
 #include "./mcp/shader_summary.hpp"
 #include "./mcp/snapshot_tools.hpp"
 #include "./mcp/texture_replace.hpp"
-#include "./mcp/upgrade_candidates.hpp"
 #include "./tools_path.hpp"
 
 namespace {
@@ -99,16 +93,12 @@ namespace devkit_resource_analysis = renodx::addons::devkit::mcp::resource_analy
 namespace devkit_resource_clone = renodx::addons::devkit::mcp::resource_clone;
 namespace devkit_resource_view_summary = renodx::addons::devkit::mcp::resource_view_summary;
 namespace devkit_texture_replace = renodx::addons::devkit::mcp::texture_replace;
-namespace devkit_device_proxy = renodx::addons::devkit::mcp::device_proxy;
 namespace devkit_device_selection = renodx::addons::devkit::mcp::device_selection;
 namespace devkit_device_summary = renodx::addons::devkit::mcp::device_summary;
 namespace devkit_draw_summary = renodx::addons::devkit::mcp::draw_summary;
 namespace devkit_shader_inspection = renodx::addons::devkit::mcp::shader_inspection;
 namespace devkit_shader_summary = renodx::addons::devkit::mcp::shader_summary;
-namespace devkit_deep_analysis = renodx::addons::devkit::mcp::deep_analysis;
 namespace devkit_live_shaders = renodx::addons::devkit::mcp::live_shaders;
-namespace devkit_output_chain = renodx::addons::devkit::mcp::output_chain;
-namespace devkit_upgrade_candidates = renodx::addons::devkit::mcp::upgrade_candidates;
 namespace devkit_mcp_runtime = renodx::addons::devkit::mcp::runtime;
 namespace devkit_mcp_server_session = renodx::addons::devkit::mcp::server_session;
 namespace devkit_snapshot_tools = renodx::addons::devkit::mcp::snapshot_tools;
@@ -127,9 +117,6 @@ inline constexpr std::wstring_view DEVKIT_MCP_PIPE_PREFIX = L"renodx-devkit-mcp"
 std::atomic<reshade::api::device*> snapshot_device = nullptr;
 std::atomic<reshade::api::device*> snapshot_queued_device = nullptr;
 std::atomic<uint32_t> snapshot_submission_counter = 0u;
-constexpr size_t MIN_SNAPSHOT_DRAW_COUNT = 64u;
-constexpr uint32_t MAX_SNAPSHOT_RETRIES = 8u;
-uint32_t snapshot_retry_count = 0u;
 auto devkit_mcp_session = devkit_mcp_server_session::Create(DEVKIT_MCP_PIPE_PREFIX);
 std::atomic<uint32_t> devkit_primary_device_api = 0u;
 
@@ -145,31 +132,14 @@ std::atomic_bool shaders_pane_show_vertex_shaders = false;
 std::atomic_bool shaders_pane_show_pixel_shaders = true;
 std::atomic_bool shaders_pane_show_compute_shaders = true;
 
-std::atomic_bool setting_devkit_start_active = false;
-std::atomic_bool setting_keep_descriptor_tracking_in_idle = false;
-std::atomic_bool devkit_tracking_active = false;
-std::atomic_bool devkit_tracking_requested = false;
-std::atomic_bool snapshot_return_to_idle = false;
-std::atomic_bool trace_return_to_idle = false;
-std::shared_mutex devkit_tracking_mutex;
-
-// Written by the UI and MCP threads, read by draw hooks on the render thread.
-std::atomic_uint32_t skip_draw_count = 0;
-// Set when a bypass switched Idle tracking on, so removing the last bypass can switch it back off.
-std::atomic_bool bypass_forced_tracking = false;
+uint32_t skip_draw_count = 0;
 
 [[nodiscard]] bool SupportsSnapshotSubmissionOrder(reshade::api::device_api api) {
   return api == reshade::api::device_api::d3d12
          || api == reshade::api::device_api::vulkan;
 }
 
-void QueueSnapshotCapture(reshade::api::device* device, std::optional<bool> return_to_idle = std::nullopt) {
-  if (return_to_idle.has_value()) {
-    snapshot_return_to_idle.store(return_to_idle.value());
-  } else if (!devkit_tracking_active.load()) {
-    snapshot_return_to_idle.store(true);
-  }
-  devkit_tracking_requested.store(true);
+void QueueSnapshotCapture(reshade::api::device* device) {
   snapshot_queued_device = device;
   if (snapshot_trace_with_snapshot.load()) {
     renodx::utils::trace::trace_scheduled_device = device;
@@ -268,19 +238,14 @@ struct DrawDetails {
   uint64_t cmd_list_handle = 0u;
   uint32_t cmd_list_draw_index = 0u;
   uint32_t submission_order = 0u;
-  // Why SRV/UAV/CBV bindings are or are not resolved for this draw ("ok" or the first reason tracking was skipped).
-  std::string descriptor_tracking_status = "no_bound_pipeline";
   std::map<std::pair<uint32_t, uint32_t>, ResourceViewDetails> srv_binds;
   std::map<std::pair<uint32_t, uint32_t>, ResourceViewDetails> uav_binds;
   std::map<std::pair<uint32_t, uint32_t>, reshade::api::buffer_range> constants;
-  std::vector<devkit_deep_analysis::PushConstantRecord> push_constants;
   std::map<uint32_t, ResourceViewDetails> render_targets;
   std::vector<PipelineBindDetails> pipeline_binds;
   std::optional<reshade::api::blend_desc> blend_desc = std::nullopt;
   std::optional<reshade::api::rasterizer_desc> rasterizer_desc = std::nullopt;
   std::optional<std::vector<ResourceBind>> resource_binds = std::nullopt;
-  std::optional<reshade::api::viewport> viewport = std::nullopt;
-  uint32_t element_count = 0u;  // vertex or index count of direct draws
 
   reshade::api::resource copy_source = {0u};
   reshade::api::resource copy_destination = {0u};
@@ -365,11 +330,9 @@ struct __declspec(uuid("3224946b-5c5f-478a-8691-83fbb9f88f1b")) CommandListData 
   std::map<std::pair<uint32_t, uint32_t>, ResourceViewDetails> compute_srv_binds;
   std::map<std::pair<uint32_t, uint32_t>, ResourceViewDetails> compute_uav_binds;
   std::map<std::pair<uint32_t, uint32_t>, reshade::api::buffer_range> constants;
-  std::vector<devkit_deep_analysis::PushConstantRecord> push_constants;
   std::map<uint32_t, ResourceViewDetails> render_targets;
   std::optional<reshade::api::blend_desc> blend_desc = std::nullopt;
   std::optional<reshade::api::rasterizer_desc> rasterizer_desc = std::nullopt;
-  std::optional<reshade::api::viewport> viewport = std::nullopt;  // slot 0 only
   uint32_t draw_counter = 0u;
 
   // std::vector<PipelineBindDetails> pipeline_binds;
@@ -442,30 +405,15 @@ struct __declspec(uuid("0190ec1a-2e19-74a6-ad41-4df0d4d8caed")) DeviceData {
 
   reshade::api::effect_runtime* runtime = nullptr;
   std::deque<std::shared_ptr<devkit_resource_analysis::PendingRequest>> pending_resource_analysis_requests;
-  std::deque<std::shared_ptr<devkit_deep_analysis::PendingConstantsRequest>> pending_constants_requests;
-  std::vector<std::pair<uint32_t, std::vector<uint8_t>>> suspended_ab_live_shaders;
   std::deque<std::shared_ptr<PendingLiveShaderRequest>> pending_live_shader_requests;
-  std::deque<std::shared_ptr<devkit_device_proxy::PendingDeviceProxyRequest>> pending_device_proxy_requests;
 
   std::unordered_map<uint32_t, std::set<uint32_t>> shader_draw_indexes;
   std::unordered_map<uint64_t, SnapshotResourceUsage> resource_usage_by_handle;
   std::vector<SnapshotRow> snapshot_rows;
   uint32_t snapshot_row_layout_key = 0u;
   uint32_t snapshot_rows_generation = 0u;
-  // Completed captures, so MCP clients can tell a fresh snapshot from the previous one.
-  uint32_t snapshot_capture_count = 0u;
-  std::int64_t snapshot_captured_at_ms = 0;
   bool snapshot_rows_valid = false;
-  struct CachedSwapchainRuntimeInfo {
-    reshade::api::color_space color_space = reshade::api::color_space::unknown;
-    uint32_t current_backbuffer_index = 0u;
-    std::vector<uint64_t> backbuffer_handles;
-    // Display (DXGI output) state; refreshed every few seconds because GetContainingOutput is not free.
-    std::optional<DXGI_OUTPUT_DESC1> output_desc = std::nullopt;
-    std::int64_t output_desc_queried_ms = 0;
-  };
   std::unordered_map<reshade::api::swapchain*, reshade::api::swapchain_desc> swapchain_descs;
-  std::unordered_map<reshade::api::swapchain*, CachedSwapchainRuntimeInfo> swapchain_runtime_info;
   std::unordered_map<reshade::api::swapchain*, HWND> swapchain_windows;
   reshade::api::swapchain* primary_swapchain = nullptr;
   std::optional<reshade::api::swapchain_desc> primary_swapchain_desc = std::nullopt;
@@ -1965,8 +1913,7 @@ renodx::utils::resource::ResourceUpgradeInfo devkit_texture_file_clone_target = 
 
   renodx::utils::resource::ResourceInfo* info = nullptr;
   renodx::utils::resource::UpdateResourceInfo(resource, [&info](renodx::utils::resource::ResourceInfo* resource_info) {
-    // A destroyed entry's handle may dangle; callers treat it like an untracked resource.
-    if (!resource_info->destroyed) info = resource_info;
+    info = resource_info;
   });
   return info;
 }
@@ -2459,8 +2406,6 @@ std::vector<DeviceData*> device_data_list;
       .resource_usage_entries = device_data->resource_usage_by_handle.size(),
       .snapshot_queued = snapshot_queued_device == device,
       .snapshot_active = snapshot_device == device,
-      .snapshot_capture_count = device_data->snapshot_capture_count,
-      .snapshot_captured_at_ms = device_data->snapshot_captured_at_ms,
   };
 
   if (device_data->primary_swapchain_desc.has_value()) {
@@ -2634,82 +2579,10 @@ std::vector<DeviceData*> device_data_list;
 [[nodiscard]] devkit_draw_summary::DrawSummary BuildDrawSummary(
     size_t draw_index,
     const DrawDetails& draw_details,
-    bool include_details,
-    uint32_t backbuffer_width = 0u,
-    uint32_t backbuffer_height = 0u) {
+    bool include_details) {
   std::set<uint32_t> shader_hashes;
   for (const auto& pipeline_bind : draw_details.pipeline_binds) {
     shader_hashes.insert(pipeline_bind.shader_hashes.begin(), pipeline_bind.shader_hashes.end());
-  }
-
-  bool blend_enabled = false;
-  if (draw_details.blend_desc.has_value()) {
-    if (draw_details.render_targets.empty()) {
-      blend_enabled = draw_details.blend_desc->blend_enable[0];
-    } else {
-      for (const auto& [rtv_index, rtv_details] : draw_details.render_targets) {
-        (void)rtv_details;
-        if (rtv_index < 8u && draw_details.blend_desc->blend_enable[rtv_index]) {
-          blend_enabled = true;
-          break;
-        }
-      }
-    }
-  }
-
-  bool writes_backbuffer = false;
-  bool is_fullscreen_pass = false;
-  const auto matches_backbuffer_dims = [backbuffer_width, backbuffer_height](const reshade::api::resource_desc& desc) {
-    return backbuffer_width > 0u
-           && backbuffer_height > 0u
-           && desc.type != reshade::api::resource_type::buffer
-           && desc.texture.width == backbuffer_width
-           && desc.texture.height == backbuffer_height;
-  };
-  std::optional<float> viewport_coverage = std::nullopt;
-  for (const auto& [rtv_index, rtv_details] : draw_details.render_targets) {
-    if (rtv_details.is_swapchain) {
-      writes_backbuffer = true;
-    }
-    const auto& rt_desc = rtv_details.resource_desc;
-    if (rtv_index == 0u && draw_details.viewport.has_value()
-        && rt_desc.type != reshade::api::resource_type::buffer && rt_desc.texture.width > 0u && rt_desc.texture.height > 0u) {
-      const auto& vp = draw_details.viewport.value();
-      // Clip the viewport to the target, then take the covered area share. Vulkan flips Y with a negative height,
-      // so the extent is the span between the two edges either way.
-      const float x0 = std::max(std::min(vp.x, vp.x + vp.width), 0.f);
-      const float y0 = std::max(std::min(vp.y, vp.y + vp.height), 0.f);
-      const float x1 = std::min(std::max(vp.x, vp.x + vp.width), static_cast<float>(rt_desc.texture.width));
-      const float y1 = std::min(std::max(vp.y, vp.y + vp.height), static_cast<float>(rt_desc.texture.height));
-      viewport_coverage = std::max(x1 - x0, 0.f) * std::max(y1 - y0, 0.f)
-                          / (static_cast<float>(rt_desc.texture.width) * static_cast<float>(rt_desc.texture.height));
-    }
-    if (matches_backbuffer_dims(rt_desc)) {
-      is_fullscreen_pass = true;
-    }
-  }
-  // A backbuffer-sized target drawn through a partial viewport (minimap, split view) is not a fullscreen pass.
-  if (viewport_coverage.has_value() && viewport_coverage.value() < 0.95f) {
-    is_fullscreen_pass = false;
-  }
-  for (const auto& [slot_space, uav_details] : draw_details.uav_binds) {
-    (void)slot_space;
-    if (uav_details.is_swapchain) {
-      writes_backbuffer = true;
-    }
-    if (matches_backbuffer_dims(uav_details.resource_desc)) {
-      is_fullscreen_pass = true;
-    }
-  }
-  if (draw_details.copy_destination.handle != 0u) {
-    renodx::utils::resource::GetResourceInfo(draw_details.copy_destination, [&](const auto& info) {
-      if (info.is_swap_chain) {
-        writes_backbuffer = true;
-      }
-      if (matches_backbuffer_dims(info.desc)) {
-        is_fullscreen_pass = true;
-      }
-    });
   }
 
   auto draw_summary = devkit_draw_summary::DrawSummary{
@@ -2721,17 +2594,7 @@ std::vector<DeviceData*> device_data_list;
       .constant_count = draw_details.constants.size(),
       .render_target_count = draw_details.render_targets.size(),
       .pipeline_count = draw_details.pipeline_binds.size(),
-      .blend_enabled = blend_enabled,
-      .additive_blend = blend_enabled && draw_details.blend_desc->dest_color_blend_factor[0] == reshade::api::blend_factor::one,
-      .writes_backbuffer = writes_backbuffer,
-      .is_fullscreen_pass = is_fullscreen_pass,
-      .element_count = draw_details.element_count,
-      .viewport_coverage = viewport_coverage,
   };
-  if (draw_details.viewport.has_value()) {
-    const auto& vp = draw_details.viewport.value();
-    draw_summary.viewport = std::array<float, 4>{vp.x, vp.y, vp.width, vp.height};
-  }
   draw_summary.shader_hashes.reserve(shader_hashes.size());
   for (auto shader_hash : shader_hashes) {
     draw_summary.shader_hashes.push_back(FormatShaderHash(shader_hash));
@@ -2743,7 +2606,6 @@ std::vector<DeviceData*> device_data_list;
     draw_summary.copy_destination_handle = FormatHandle(draw_details.copy_destination.handle);
   }
 
-  draw_summary.descriptor_tracking_status = draw_details.descriptor_tracking_status;
   if (draw_details.IsDispatch()) {
     draw_summary.active_shader_stage = StreamToString(reshade::api::pipeline_stage::compute_shader);
   } else if (draw_details.IsDraw()) {
@@ -4120,1491 +3982,6 @@ void ProcessPendingLiveShaderRequests(
   }
 }
 
-[[nodiscard]] devkit_snapshot_tools::TrackingStateSummary GetTrackingStateSummaryForMcp() {
-  const bool active = devkit_tracking_active.load();
-  // Mirrors the switches in SetDevkitTrackingActive.
-  return devkit_snapshot_tools::TrackingStateSummary{
-      .active = active,
-      .requested = devkit_tracking_requested.load(),
-      .start_active = setting_devkit_start_active.load(),
-      .pending_return_to_idle = snapshot_return_to_idle.load(),
-      .bypassed_shader_count = skip_draw_count.load(),
-      .hook_subsystems = {
-          {"drawAndDispatch", active},
-          {"stateHotPath", active},
-          {"apiTrace", active},
-          {"renderPassEvents", active},
-          {"textureReplace", active},
-          {"descriptorTables", active || setting_keep_descriptor_tracking_in_idle.load()},
-          {"constantBufferCapture", active && renodx::utils::constants::capture_constant_buffers.load()},
-          {"pushConstantCapture", active && renodx::utils::constants::capture_push_descriptors.load()},
-          {"resourceLifetime", true},
-          {"pipelineCreation", true},
-          {"present", true},
-      },
-  };
-}
-
-namespace hdr_metadata_hook {
-[[nodiscard]] json ToJson();
-}  // namespace hdr_metadata_hook
-
-[[nodiscard]] json BuildSwapchainInfoForMcp(uint32_t device_index) {
-  std::shared_lock list_lock(device_data_list_mutex);
-  if (device_index >= device_data_list.size()) {
-    throw std::runtime_error(std::format("Device #{} is not available.", device_index));
-  }
-  auto* device_data = device_data_list[device_index];
-  std::shared_lock device_lock(device_data->mutex);
-  auto* device = device_data->device;
-
-  json swapchains_json = json::array();
-  for (const auto& [swapchain_ptr, desc] : device_data->swapchain_descs) {
-    reshade::api::color_space color_space = reshade::api::color_space::unknown;
-    json backbuffer_handles = json::array();
-    uint32_t current_backbuffer_index = 0u;
-    json display = nullptr;
-    if (const auto rt_it = device_data->swapchain_runtime_info.find(swapchain_ptr);
-        rt_it != device_data->swapchain_runtime_info.end()) {
-      color_space = rt_it->second.color_space;
-      current_backbuffer_index = rt_it->second.current_backbuffer_index;
-      for (const auto bb_handle : rt_it->second.backbuffer_handles) {
-        if (bb_handle != 0u) {
-          backbuffer_handles.push_back(FormatHandle(bb_handle));
-        }
-      }
-      if (rt_it->second.output_desc.has_value()) {
-        const auto& out = rt_it->second.output_desc.value();
-        // The output's color space is what Windows drives the display in: G2084/P2020 means HDR is on in the OS.
-        display = {
-            {"osHdrEnabled", out.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020},
-            {"outputColorSpace", static_cast<uint32_t>(out.ColorSpace)},
-            {"bitsPerColor", out.BitsPerColor},
-            {"minLuminanceNits", out.MinLuminance},
-            {"maxLuminanceNits", out.MaxLuminance},
-            {"maxFullFrameLuminanceNits", out.MaxFullFrameLuminance},
-            {"redPrimary", {out.RedPrimary[0], out.RedPrimary[1]}},
-            {"greenPrimary", {out.GreenPrimary[0], out.GreenPrimary[1]}},
-            {"bluePrimary", {out.BluePrimary[0], out.BluePrimary[1]}},
-            {"whitePoint", {out.WhitePoint[0], out.WhitePoint[1]}},
-        };
-      }
-    }
-    const bool is_hdr_color_space =
-        color_space == reshade::api::color_space::extended_srgb_linear
-        || color_space == reshade::api::color_space::hdr10_st2084
-        || color_space == reshade::api::color_space::hdr10_hlg;
-
-    swapchains_json.push_back(json{
-        {"swapchainHandle", FormatPointer(swapchain_ptr)},
-        {"width", desc.back_buffer.texture.width},
-        {"height", desc.back_buffer.texture.height},
-        {"format", StreamToString(desc.back_buffer.texture.format)},
-        {"bufferCount", desc.back_buffer_count},
-        {"sampleCount", desc.back_buffer.texture.samples},
-        {"presentMode", static_cast<uint32_t>(desc.present_mode)},
-        {"presentFlags", desc.present_flags},
-        {"colorSpace", StreamToString(color_space)},
-        {"isHdrColorSpace", is_hdr_color_space},
-        {"currentBackbufferIndex", current_backbuffer_index},
-        {"backbufferHandles", backbuffer_handles},
-        {"isFlipModel", IsFlipSwapchainPresentMode(desc.present_mode)},
-        {"display", display},
-    });
-  }
-
-  const bool proxy_enabled =
-      renodx::utils::device_proxy::shared.data != nullptr
-      && renodx::utils::device_proxy::shared.data->use_device_proxy.load(std::memory_order_relaxed)
-      && !renodx::utils::device_proxy::shared.data->remove_device_proxy.load(std::memory_order_relaxed);
-  const auto proxy_mode = ResolveDeviceProxyOutputModeConfig();
-
-  return json{
-      {"deviceIndex", device_index},
-      {"deviceHandle", FormatPointer(device)},
-      {"api", StreamToString(device->get_api())},
-      {"isD3D9Ex", device_data->is_d3d9_ex},
-      {"primarySwapchainIsFlip", device_data->primary_swapchain_is_flip},
-      {"swapchainCount", swapchains_json.size()},
-      {"swapchains", swapchains_json},
-      // Last IDXGISwapChain4::SetHDRMetaData call from the game (process-wide).
-      {"gameHdrMetadata", hdr_metadata_hook::ToJson()},
-      {"deviceProxy", {
-                          {"enabled", proxy_enabled},
-                          {"configuredOutputMode", setting_device_proxy_output_mode},
-                          {"targetFormat", StreamToString(proxy_mode.target_format)},
-                          {"targetColorSpace", StreamToString(proxy_mode.target_color_space)},
-                      }},
-  };
-}
-
-[[nodiscard]] std::vector<devkit_snapshot_tools::TrackedResourceSummary> ListTrackedResourcesForMcp(uint32_t device_index) {
-  reshade::api::device* device = nullptr;
-  std::unordered_map<uint64_t, SnapshotResourceUsage> resource_usage_copy;
-  {
-    std::shared_lock list_lock(device_data_list_mutex);
-    if (device_index >= device_data_list.size()) {
-      throw std::runtime_error(std::format("Device #{} is not available.", device_index));
-    }
-    auto* device_data = device_data_list[device_index];
-    std::shared_lock device_lock(device_data->mutex);
-    device = device_data->device;
-    resource_usage_copy = device_data->resource_usage_by_handle;
-  }
-
-  struct RawResourceMeta {
-    uint64_t handle = 0u;
-    reshade::api::resource_desc desc = {};
-    bool is_swap_chain = false;
-    bool clone_enabled = false;
-  };
-  std::vector<RawResourceMeta> raw_resources;
-  renodx::utils::resource::ForEachResourceInfo([&](const auto& info) {
-    if (info.device != device) return;
-    if (info.destroyed || info.is_clone) return;
-    if (info.desc.type == reshade::api::resource_type::unknown) return;
-    raw_resources.push_back(RawResourceMeta{
-        .handle = info.resource.handle,
-        .desc = info.desc,
-        .is_swap_chain = info.is_swap_chain,
-        .clone_enabled = info.clone_enabled,
-    });
-  });
-
-  std::vector<devkit_snapshot_tools::TrackedResourceSummary> resources;
-  resources.reserve(raw_resources.size());
-  for (const auto& raw : raw_resources) {
-    const SnapshotResourceUsage* usage = nullptr;
-    if (const auto it = resource_usage_copy.find(raw.handle); it != resource_usage_copy.end()) {
-      usage = &it->second;
-    }
-
-    const bool is_buffer = (raw.desc.type == reshade::api::resource_type::buffer);
-    resources.push_back(devkit_snapshot_tools::TrackedResourceSummary{
-        .resource_handle = FormatHandle(raw.handle),
-        .type = StreamToString(raw.desc.type),
-        .format = is_buffer ? "buffer" : StreamToString(raw.desc.texture.format),
-        .width = is_buffer ? static_cast<uint32_t>(std::min<uint64_t>(raw.desc.buffer.size, UINT32_MAX)) : raw.desc.texture.width,
-        .height = is_buffer ? 0u : raw.desc.texture.height,
-        .depth_or_layers = is_buffer ? 0u : raw.desc.texture.depth_or_layers,
-        .mip_levels = is_buffer ? 0u : raw.desc.texture.levels,
-        .sample_count = is_buffer ? 1u : raw.desc.texture.samples,
-        .usage = static_cast<uint32_t>(raw.desc.usage),
-        .is_backbuffer = raw.is_swap_chain,
-        .clone_enabled = raw.clone_enabled,
-        .seen_srv = usage != nullptr && usage->seen_srv,
-        .seen_uav = usage != nullptr && usage->seen_uav,
-        .seen_rtv = usage != nullptr && usage->seen_rtv,
-        .first_snapshot_index = usage != nullptr ? usage->first_snapshot_index : -1,
-    });
-  }
-
-  std::ranges::sort(resources, [](const auto& lhs, const auto& rhs) {
-    const bool lhs_snap = lhs.first_snapshot_index >= 0;
-    const bool rhs_snap = rhs.first_snapshot_index >= 0;
-    if (lhs_snap != rhs_snap) return lhs_snap > rhs_snap;
-    if (lhs.first_snapshot_index != rhs.first_snapshot_index) return lhs.first_snapshot_index < rhs.first_snapshot_index;
-    return lhs.resource_handle < rhs.resource_handle;
-  });
-
-  return resources;
-}
-
-// Caller holds the device mutex (MCP) or runs on the overlay thread (UI) and checked the flag changes.
-void SetShaderDrawBypass(ShaderDetails& details, bool bypass) {
-  details.bypass_draw = bypass;
-  skip_draw_count += bypass ? +1u : -1u;
-
-  // Bypass runs in the draw hooks, which only exist while tracking is active.
-  if (bypass && !devkit_tracking_requested.load()) {
-    devkit_tracking_requested.store(true);
-    bypass_forced_tracking.store(true);
-  } else if (!bypass && skip_draw_count.load() == 0u && bypass_forced_tracking.exchange(false)) {
-    devkit_tracking_requested.store(false);
-  }
-}
-
-[[nodiscard]] ToolResult SetShaderBypassForMcp(uint32_t device_index, uint32_t shader_hash, bool bypass) {
-  std::shared_lock list_lock(device_data_list_mutex);
-  if (device_index >= device_data_list.size()) {
-    throw std::runtime_error(std::format("Device #{} is not available.", device_index));
-  }
-  auto* device_data = device_data_list[device_index];
-  std::unique_lock device_lock(device_data->mutex);
-
-  auto it = device_data->shader_details.find(shader_hash);
-  if (it == device_data->shader_details.end()) {
-    const auto error = std::format("Shader {} is not tracked on device #{}.", FormatShaderHash(shader_hash), device_index);
-    return ToolResult{
-        .text = error,
-        .structured_content = json{{"error", error}},
-        .is_error = true,
-    };
-  }
-
-  if (it->second.bypass_draw != bypass) {
-    SetShaderDrawBypass(it->second, bypass);
-  }
-
-  json bypassed_hashes = json::array();
-  for (const auto& [hash, details] : device_data->shader_details) {
-    if (details.bypass_draw) {
-      bypassed_hashes.push_back(FormatShaderHash(hash));
-    }
-  }
-
-  const auto hash_text = FormatShaderHash(shader_hash);
-  return ToolResult{
-      .text = std::format(
-          "{} draw bypass for shader {} on device #{} ({} shader(s) currently bypassed).",
-          bypass ? "Enabled" : "Disabled",
-          hash_text,
-          device_index,
-          bypassed_hashes.size()),
-      .structured_content = json{
-          {"deviceIndex", device_index},
-          {"shaderHash", hash_text},
-          {"bypass", bypass},
-          {"bypassedShaders", bypassed_hashes},
-          {"trackingActive", devkit_tracking_active.load()},
-          {"trackingRequested", devkit_tracking_requested.load()},
-      },
-  };
-}
-
-[[nodiscard]] devkit_output_chain::ResourceEndpoint BuildOutputChainEndpoint(
-    uint64_t resource_handle,
-    uint64_t resource_view_handle,
-    const reshade::api::resource_desc& resource_desc,
-    reshade::api::format effective_format,
-    bool is_backbuffer,
-    bool is_hdr10_backbuffer,
-    std::string role) {
-  const auto fmt = (effective_format != reshade::api::format::unknown)
-                       ? effective_format
-                       : (resource_desc.type == reshade::api::resource_type::buffer
-                              ? reshade::api::format::unknown
-                              : resource_desc.texture.format);
-  const bool is_r11g11b10f = (fmt == reshade::api::format::r11g11b10_float);
-  const bool is_rgb10a2_unorm =
-      (fmt == reshade::api::format::r10g10b10a2_unorm || fmt == reshade::api::format::b10g10r10a2_unorm);
-  const bool is_float =
-      (fmt == reshade::api::format::r16g16b16a16_float
-       || fmt == reshade::api::format::r32g32b32a32_float
-       || fmt == reshade::api::format::r32g32b32_float
-       || fmt == reshade::api::format::r32g32_float
-       || fmt == reshade::api::format::r16g16_float
-       || fmt == reshade::api::format::r32_float
-       || fmt == reshade::api::format::r16_float
-       || is_r11g11b10f);
-  const bool is_unorm =
-      (is_rgb10a2_unorm
-       || fmt == reshade::api::format::r8g8b8a8_unorm
-       || fmt == reshade::api::format::r8g8b8a8_unorm_srgb
-       || fmt == reshade::api::format::b8g8r8a8_unorm
-       || fmt == reshade::api::format::b8g8r8a8_unorm_srgb
-       || fmt == reshade::api::format::r8g8b8x8_unorm
-       || fmt == reshade::api::format::r8g8b8x8_unorm_srgb
-       || fmt == reshade::api::format::b8g8r8x8_unorm
-       || fmt == reshade::api::format::b8g8r8x8_unorm_srgb
-       || fmt == reshade::api::format::r16g16b16a16_unorm
-       || fmt == reshade::api::format::r16g16_unorm
-       || fmt == reshade::api::format::r8g8_unorm
-       || fmt == reshade::api::format::r8_unorm
-       || fmt == reshade::api::format::r16_unorm);
-  const bool supports_negative = (is_float && !is_r11g11b10f);
-  const bool is_buffer = (resource_desc.type == reshade::api::resource_type::buffer);
-
-  return devkit_output_chain::ResourceEndpoint{
-      .resource_handle = resource_handle,
-      .resource_view_handle = resource_view_handle,
-      .resource_handle_hex = FormatHandle(resource_handle),
-      .resource_view_handle_hex = resource_view_handle == 0u ? std::string{} : FormatHandle(resource_view_handle),
-      .role = std::move(role),
-      .type = StreamToString(resource_desc.type),
-      .format = is_buffer ? "buffer" : StreamToString(fmt),
-      .width = is_buffer ? 0u : resource_desc.texture.width,
-      .height = is_buffer ? 0u : resource_desc.texture.height,
-      .depth_or_layers = is_buffer ? 0u : resource_desc.texture.depth_or_layers,
-      .is_backbuffer = is_backbuffer,
-      .is_hdr10_backbuffer = is_hdr10_backbuffer,
-      .is_float = is_float,
-      .is_unorm = is_unorm,
-      .is_r11g11b10f = is_r11g11b10f,
-      .is_rgb10a2_unorm = is_rgb10a2_unorm,
-      .supports_negative = supports_negative,
-  };
-}
-
-[[nodiscard]] devkit_output_chain::SnapshotGraph BuildSnapshotGraphForMcp(uint32_t device_index) {
-  std::shared_lock list_lock(device_data_list_mutex);
-  if (device_index >= device_data_list.size()) {
-    throw std::runtime_error(std::format("Device #{} is not available.", device_index));
-  }
-  auto* device_data = device_data_list[device_index];
-  std::shared_lock device_lock(device_data->mutex);
-
-  devkit_output_chain::SnapshotGraph graph = {
-      .device_index = device_index,
-  };
-
-  uint32_t backbuffer_width = 0u;
-  uint32_t backbuffer_height = 0u;
-  if (device_data->primary_swapchain_desc.has_value()) {
-    backbuffer_width = device_data->primary_swapchain_desc->back_buffer.texture.width;
-    backbuffer_height = device_data->primary_swapchain_desc->back_buffer.texture.height;
-  }
-
-  std::unordered_set<uint64_t> backbuffer_set;
-  std::unordered_set<uint64_t> hdr10_backbuffer_set;
-  for (const auto& [swapchain_ptr, rt_info] : device_data->swapchain_runtime_info) {
-    (void)swapchain_ptr;
-    const bool is_hdr10 =
-        (rt_info.color_space == reshade::api::color_space::hdr10_st2084
-         || rt_info.color_space == reshade::api::color_space::hdr10_hlg);
-    for (const auto bb_handle : rt_info.backbuffer_handles) {
-      if (bb_handle != 0u && backbuffer_set.insert(bb_handle).second) {
-        graph.backbuffer_handles.push_back(bb_handle);
-        graph.backbuffer_handle_hexes.push_back(FormatHandle(bb_handle));
-      }
-      if (bb_handle != 0u && is_hdr10) {
-        hdr10_backbuffer_set.insert(bb_handle);
-      }
-    }
-  }
-
-  // Streamline DLSS-G renders into a fake swapchain buffer and presents a frame-generated copy of it through passes
-  // DevKit cannot see, so the fake buffer stands in for the backbuffer.
-  std::unordered_set<uint64_t> fake_swapchain_set;
-  for (const auto& draw : device_data->draw_details_list) {
-    for (const auto& [rtv_index, rtv] : draw.render_targets) {
-      (void)rtv_index;
-      if (rtv.resource.handle != 0u && rtv.resource_reflection.find("fake-swapchain-buffer") != std::string::npos
-          && backbuffer_set.insert(rtv.resource.handle).second) {
-        fake_swapchain_set.insert(rtv.resource.handle);
-        graph.backbuffer_handles.push_back(rtv.resource.handle);
-        graph.backbuffer_handle_hexes.push_back(FormatHandle(rtv.resource.handle));
-      }
-    }
-  }
-  std::unordered_set<uint64_t> written_resources;
-  uint64_t last_fake_swapchain_copy_source = 0u;
-
-  graph.draws.reserve(device_data->draw_details_list.size());
-  for (size_t index = 0u; index < device_data->draw_details_list.size(); ++index) {
-    const auto& draw = device_data->draw_details_list[index];
-    const auto summary = BuildDrawSummary(index, draw, false, backbuffer_width, backbuffer_height);
-
-    devkit_output_chain::DrawNode node = {
-        .draw_index = static_cast<uint32_t>(index),
-        .method = summary.method,
-        .active_shader_stage = summary.active_shader_stage,
-        .shader_hashes = summary.shader_hashes,
-        .blend_enabled = summary.blend_enabled,
-        .additive_blend = summary.additive_blend,
-        .writes_backbuffer = summary.writes_backbuffer,
-        .is_fullscreen_pass = summary.is_fullscreen_pass,
-        .element_count = summary.element_count,
-    };
-    if (draw.blend_desc.has_value()) {
-      for (const auto& [rtv_index, rtv] : draw.render_targets) {
-        (void)rtv;
-        if (rtv_index >= 8u) continue;
-        const auto color_write_mask = static_cast<uint32_t>(draw.blend_desc->render_target_write_mask[rtv_index]) & 0x7u;
-        if (draw.blend_desc->blend_enable[rtv_index] || color_write_mask != 0x7u) {
-          node.reads_destination = true;
-        }
-      }
-    }
-
-    for (const auto& [slot_space, srv] : draw.srv_binds) {
-      if (srv.resource.handle == 0u) continue;
-      if (draw.resource_binds.has_value()
-          && !IsResourceBindUsedByShader(draw.resource_binds, ResourceBind::BindType::SRV, slot_space.first, slot_space.second)) {
-        continue;
-      }
-      node.inputs.push_back(BuildOutputChainEndpoint(
-          srv.resource.handle,
-          srv.resource_view.handle,
-          srv.resource_desc,
-          srv.resource_view_desc.format,
-          srv.is_swapchain || backbuffer_set.contains(srv.resource.handle),
-          hdr10_backbuffer_set.contains(srv.resource.handle),
-          std::format("srv:t{}", slot_space.first)));
-    }
-
-    for (const auto& [rtv_index, rtv] : draw.render_targets) {
-      if (rtv.resource.handle == 0u) continue;
-      const bool is_bb = rtv.is_swapchain || backbuffer_set.contains(rtv.resource.handle);
-      if (is_bb) {
-        node.writes_backbuffer = true;
-      }
-      node.outputs.push_back(BuildOutputChainEndpoint(
-          rtv.resource.handle,
-          rtv.resource_view.handle,
-          rtv.resource_desc,
-          rtv.resource_view_desc.format,
-          is_bb,
-          hdr10_backbuffer_set.contains(rtv.resource.handle),
-          std::format("rtv:{}", rtv_index)));
-    }
-
-    for (const auto& [slot_space, uav] : draw.uav_binds) {
-      if (uav.resource.handle == 0u) continue;
-      if (draw.resource_binds.has_value()
-          && !IsResourceBindUsedByShader(draw.resource_binds, ResourceBind::BindType::UAV, slot_space.first, slot_space.second)) {
-        continue;
-      }
-      const bool is_bb = uav.is_swapchain || backbuffer_set.contains(uav.resource.handle);
-      if (is_bb) {
-        node.writes_backbuffer = true;
-      }
-      node.outputs.push_back(BuildOutputChainEndpoint(
-          uav.resource.handle,
-          uav.resource_view.handle,
-          uav.resource_desc,
-          uav.resource_view_desc.format,
-          is_bb,
-          hdr10_backbuffer_set.contains(uav.resource.handle),
-          std::format("uav:u{}", slot_space.first)));
-    }
-
-    if (draw.copy_source.handle != 0u) {
-      reshade::api::resource_desc src_desc = {};
-      bool src_is_bb = backbuffer_set.contains(draw.copy_source.handle);
-      renodx::utils::resource::GetResourceInfo(draw.copy_source, [&](const auto& info) {
-        src_desc = info.desc;
-        src_is_bb = src_is_bb || info.is_swap_chain;
-      });
-      node.inputs.push_back(BuildOutputChainEndpoint(
-          draw.copy_source.handle,
-          0u,
-          src_desc,
-          reshade::api::format::unknown,
-          src_is_bb,
-          hdr10_backbuffer_set.contains(draw.copy_source.handle),
-          "copy_src"));
-    }
-
-    if (draw.copy_destination.handle != 0u) {
-      reshade::api::resource_desc dst_desc = {};
-      bool dst_is_bb = backbuffer_set.contains(draw.copy_destination.handle);
-      renodx::utils::resource::GetResourceInfo(draw.copy_destination, [&](const auto& info) {
-        dst_desc = info.desc;
-        dst_is_bb = dst_is_bb || info.is_swap_chain;
-      });
-      if (dst_is_bb) {
-        node.writes_backbuffer = true;
-      }
-      node.outputs.push_back(BuildOutputChainEndpoint(
-          draw.copy_destination.handle,
-          0u,
-          dst_desc,
-          reshade::api::format::unknown,
-          dst_is_bb,
-          hdr10_backbuffer_set.contains(draw.copy_destination.handle),
-          "copy_dst"));
-    }
-
-    if (fake_swapchain_set.contains(draw.copy_source.handle)) {
-      last_fake_swapchain_copy_source = draw.copy_source.handle;
-    }
-    // The frame-generated image DLSS-G presents is produced by a pass DevKit cannot see. A copy into the backbuffer
-    // whose source nothing wrote is taken to present the last fake swapchain buffer that was copied away.
-    if (node.method == "Copy" && node.writes_backbuffer && !node.inputs.empty() && last_fake_swapchain_copy_source != 0u
-        && !written_resources.contains(node.inputs.front().resource_handle)) {
-      reshade::api::resource_desc fake_desc = {};
-      renodx::utils::resource::GetResourceInfo(reshade::api::resource{last_fake_swapchain_copy_source}, [&](const auto& info) {
-        fake_desc = info.desc;
-      });
-      node.inputs.front() = BuildOutputChainEndpoint(
-          last_fake_swapchain_copy_source,
-          0u,
-          fake_desc,
-          reshade::api::format::unknown,
-          true,
-          false,
-          "copy_src");
-    }
-    for (const auto& output : node.outputs) {
-      written_resources.insert(output.resource_handle);
-    }
-
-    graph.draws.push_back(std::move(node));
-  }
-
-  return graph;
-}
-
-[[nodiscard]] std::vector<devkit_resource_analysis::ScanTargetSpec> ResolveBatchScanTargetsForMcp(
-    uint32_t device_index,
-    const std::vector<uint32_t>& draw_indices,
-    bool include_output_chain) {
-  const auto graph = BuildSnapshotGraphForMcp(device_index);
-  std::vector<devkit_resource_analysis::ScanTargetSpec> targets;
-
-  const auto append_draw_outputs = [&](const devkit_output_chain::DrawNode& draw) {
-    for (const auto& output : draw.outputs) {
-      if (output.type != "texture_2d" && output.type != "surface") continue;
-      targets.push_back(devkit_resource_analysis::ScanTargetSpec{
-          .resource_view = reshade::api::resource_view{output.resource_view_handle},
-          .resource = reshade::api::resource{output.resource_handle},
-          .draw_index = draw.draw_index,
-          .shader_hashes = draw.shader_hashes,
-          .label = std::format("draw#{} {} ({})", draw.draw_index, output.role, output.format),
-      });
-    }
-  };
-
-  if (include_output_chain && !graph.draws.empty()) {
-    const auto trace = devkit_output_chain::TraceOutputChain(graph, 64u, false);
-    for (const auto& pass : trace.chain) {
-      if (pass.draw_index < graph.draws.size()) {
-        append_draw_outputs(graph.draws[pass.draw_index]);
-      }
-    }
-  }
-
-  for (const auto draw_index : draw_indices) {
-    if (draw_index >= graph.draws.size()) {
-      throw std::runtime_error(std::format("drawIndex {} is out of range.", draw_index));
-    }
-    append_draw_outputs(graph.draws[draw_index]);
-  }
-
-  return targets;
-}
-
-[[nodiscard]] ToolResult GetLiveShaderStatusForMcp(uint32_t device_index) {
-  std::shared_lock list_lock(device_data_list_mutex);
-  if (device_index >= device_data_list.size()) {
-    throw std::runtime_error(std::format("Device #{} is not available.", device_index));
-  }
-  auto* device_data = device_data_list[device_index];
-  std::shared_lock device_lock(device_data->mutex);
-
-  json shaders_json = json::array();
-  size_t ok_count = 0u;
-  size_t error_count = 0u;
-  for (const auto& [shader_hash, details] : device_data->shader_details) {
-    if (!details.disk_shader.has_value()) continue;
-    const auto& disk = details.disk_shader.value();
-    const bool ok = disk.IsCompilationOK();
-    if (ok) {
-      ++ok_count;
-    } else {
-      ++error_count;
-    }
-
-    size_t draw_count = 0u;
-    if (const auto it = device_data->shader_draw_indexes.find(shader_hash);
-        it != device_data->shader_draw_indexes.end()) {
-      draw_count = it->second.size();
-    }
-
-    json compile_error = nullptr;
-    json diagnostics = json::array();
-    if (!ok) {
-      const std::string compile_error_text = disk.GetCompilationException().what();
-      compile_error = compile_error_text;
-      // FXC/DXC lines: `file(line,col[-col]): error X3004: message`; other lines are not diagnostics.
-      static const std::regex diagnostic_pattern(R"(^(.*)\((\d+),(\d+)(?:-\d+)?\):\s*(error|warning)\s+(\w+):\s*(.*)$)");
-      std::istringstream compile_error_lines(compile_error_text);
-      for (std::string line; std::getline(compile_error_lines, line);) {
-        if (std::smatch match; std::regex_match(line, match, diagnostic_pattern)) {
-          diagnostics.push_back(json{
-              {"file", match[1].str()},
-              {"line", std::stoul(match[2].str())},
-              {"column", std::stoul(match[3].str())},
-              {"severity", match[4].str()},
-              {"code", match[5].str()},
-              {"message", match[6].str()},
-          });
-        }
-      }
-    }
-
-    shaders_json.push_back(json{
-        {"shaderHash", FormatShaderHash(shader_hash)},
-        {"path", disk.file_path.string()},
-        {"fileAlias", disk.GetFileAlias()},
-        {"removed", disk.removed},
-        {"isCompilationOk", ok},
-        {"compileError", compile_error},
-        {"diagnostics", diagnostics},
-        {"isActiveDiskSource", details.shader_source == ShaderDetails::ShaderSource::DISK_SHADER},
-        {"bytecodeSize", ok ? disk.GetCompilationData().size() : 0u},
-        {"snapshotDrawCount", draw_count},
-    });
-  }
-
-  const auto live_dir = GetEffectiveLiveDirectory(renodx::utils::shader::compiler::watcher::GetLivePath());
-  json result = {
-      {"deviceIndex", device_index},
-      {"liveDirectory", live_dir.string()},
-      {"liveReloadEnabled", setting_live_reload},
-      {"runtimeReplacementCount", renodx::utils::shader::runtime_replacement_count.load()},
-      {"trackedDiskShaderCount", shaders_json.size()},
-      {"compiledOkCount", ok_count},
-      {"compileErrorCount", error_count},
-      {"shaders", shaders_json},
-  };
-
-  return ToolResult{
-      .text = std::format(
-          "Device #{} live shader status: {} disk shader(s) ({} ok, {} error(s)), {} active runtime replacement(s).",
-          device_index,
-          shaders_json.size(),
-          ok_count,
-          error_count,
-          renodx::utils::shader::runtime_replacement_count.load()),
-      .structured_content = result,
-  };
-}
-
-[[nodiscard]] std::shared_ptr<devkit_deep_analysis::PendingConstantsRequest> PrepareConstantsRequestForMcp(
-    uint32_t device_index,
-    uint32_t draw_index,
-    std::optional<uint32_t> slot_filter,
-    std::optional<uint32_t> space_filter,
-    uint32_t max_bytes) {
-  std::shared_lock list_lock(device_data_list_mutex);
-  if (device_index >= device_data_list.size()) {
-    throw std::runtime_error(std::format("Device #{} is not available.", device_index));
-  }
-  auto* device_data = device_data_list[device_index];
-  std::shared_lock device_lock(device_data->mutex);
-
-  if (draw_index >= device_data->draw_details_list.size()) {
-    throw std::runtime_error(std::format("drawIndex {} is out of range.", draw_index));
-  }
-  const auto& draw = device_data->draw_details_list[draw_index];
-
-  auto request = std::make_shared<devkit_deep_analysis::PendingConstantsRequest>();
-  request->device_index = device_index;
-  request->draw_index = draw_index;
-  request->max_bytes = max_bytes;
-  request->push_constants = draw.push_constants;
-
-  std::set<uint32_t> hashes;
-  for (const auto& pb : draw.pipeline_binds) {
-    hashes.insert(pb.shader_hashes.begin(), pb.shader_hashes.end());
-  }
-  for (const auto h : hashes) {
-    request->shader_hashes.push_back(FormatShaderHash(h));
-  }
-
-  for (const auto& [slot_space, buffer_range] : draw.constants) {
-    if (buffer_range.buffer.handle == 0u) continue;
-    if (slot_filter.has_value() && slot_space.first != slot_filter.value()) continue;
-    if (space_filter.has_value() && slot_space.second != space_filter.value()) continue;
-
-    devkit_deep_analysis::ConstantBufferBinding binding = {
-        .slot = slot_space.first,
-        .space = slot_space.second,
-        .buffer_handle = buffer_range.buffer.handle,
-        .buffer_handle_hex = FormatHandle(buffer_range.buffer.handle),
-        .offset = buffer_range.offset,
-        .size = buffer_range.size,
-        .used_by_active_shader = IsResourceBindUsedByShader(draw.resource_binds, ResourceBind::BindType::CBV, slot_space.first, slot_space.second),
-    };
-
-    if (renodx::utils::constants::shared.data != nullptr) {
-      renodx::utils::constants::shared.data->buffer_range_data.if_contains(
-          buffer_range.buffer.handle,
-          [&](const std::pair<const uint64_t, renodx::utils::constants::BufferRangeData>& pair) {
-            const auto& cache = pair.second.cache;
-            if (!cache.empty() && buffer_range.offset < cache.size()) {
-              const size_t avail = cache.size() - static_cast<size_t>(buffer_range.offset);
-              const size_t range_sz = (buffer_range.size == UINT64_MAX || buffer_range.size == 0u)
-                                          ? avail
-                                          : std::min<size_t>(static_cast<size_t>(buffer_range.size), avail);
-              const size_t copy_sz = std::min<size_t>(range_sz, max_bytes);
-              binding.cached_bytes.assign(
-                  cache.begin() + static_cast<std::ptrdiff_t>(buffer_range.offset),
-                  cache.begin() + static_cast<std::ptrdiff_t>(buffer_range.offset + copy_sz));
-            }
-          });
-    }
-
-    request->bindings.push_back(std::move(binding));
-  }
-
-  return request;
-}
-
-bool EnqueuePendingConstantsRequest(
-    uint32_t device_index,
-    const std::shared_ptr<devkit_deep_analysis::PendingConstantsRequest>& request) {
-  std::shared_lock list_lock(device_data_list_mutex);
-  if (device_index >= device_data_list.size()) return false;
-  auto* device_data = device_data_list[device_index];
-  std::unique_lock device_lock(device_data->mutex);
-  device_data->pending_constants_requests.push_back(request);
-  return true;
-}
-
-void CancelPendingConstantsRequest(
-    uint32_t device_index,
-    const std::shared_ptr<devkit_deep_analysis::PendingConstantsRequest>& request) {
-  std::shared_lock list_lock(device_data_list_mutex);
-  if (device_index >= device_data_list.size()) return;
-  auto* device_data = device_data_list[device_index];
-  std::unique_lock device_lock(device_data->mutex);
-  std::erase(device_data->pending_constants_requests, request);
-}
-
-[[nodiscard]] devkit_deep_analysis::SnapshotProfile BuildSnapshotProfileForMcp(uint32_t device_index) {
-  const auto graph = BuildSnapshotGraphForMcp(device_index);
-  const auto trace = devkit_output_chain::TraceOutputChain(graph, 64u, false);
-
-  devkit_deep_analysis::SnapshotProfile profile = {
-      .device_index = device_index,
-      .total_draws = graph.draws.size(),
-      .ui_start_draw_index = trace.ui_start_draw_index,
-  };
-
-  {
-    std::shared_lock list_lock(device_data_list_mutex);
-    if (device_index < device_data_list.size()) {
-      auto* device_data = device_data_list[device_index];
-      std::shared_lock device_lock(device_data->mutex);
-      if (device_data->primary_swapchain_desc.has_value()) {
-        profile.swapchain_format = StreamToString(device_data->primary_swapchain_desc->back_buffer.texture.format);
-        profile.swapchain_width = device_data->primary_swapchain_desc->back_buffer.texture.width;
-        profile.swapchain_height = device_data->primary_swapchain_desc->back_buffer.texture.height;
-      }
-      if (device_data->primary_swapchain != nullptr) {
-        if (const auto rt_it = device_data->swapchain_runtime_info.find(device_data->primary_swapchain);
-            rt_it != device_data->swapchain_runtime_info.end()) {
-          profile.swapchain_color_space = StreamToString(rt_it->second.color_space);
-        }
-      } else if (!device_data->swapchain_runtime_info.empty()) {
-        profile.swapchain_color_space = StreamToString(device_data->swapchain_runtime_info.begin()->second.color_space);
-      }
-    }
-  }
-
-  for (const auto& draw : graph.draws) {
-    for (const auto& hash : draw.shader_hashes) {
-      profile.shader_draw_counts[hash] += 1u;
-    }
-    for (const auto& output : draw.outputs) {
-      if (!output.format.empty()) {
-        profile.target_formats.insert(output.format);
-      }
-    }
-  }
-
-  for (const auto& pass : trace.chain) {
-    for (const auto& hash : pass.shader_hashes) {
-      profile.output_chain_shaders.push_back(hash);
-    }
-  }
-
-  return profile;
-}
-
-[[nodiscard]] ToolResult QueueTraceForMcp(uint32_t device_index, std::optional<bool> return_to_idle) {
-  std::shared_lock list_lock(device_data_list_mutex);
-  if (device_index >= device_data_list.size()) {
-    throw std::runtime_error(std::format("Device #{} is not available.", device_index));
-  }
-  auto* device = device_data_list[device_index]->device;
-
-  if (return_to_idle.has_value()) {
-    trace_return_to_idle.store(return_to_idle.value());
-  } else if (!devkit_tracking_active.load()) {
-    trace_return_to_idle.store(true);
-  }
-
-  renodx::utils::trace::ClearCapturedTrace();
-  renodx::utils::trace::trace_capture_to_memory.store(true);
-  devkit_tracking_requested.store(true);
-  renodx::utils::trace::trace_scheduled_device = device;
-
-  return ToolResult{
-      .text = std::format(
-          "Queued a 1-frame API trace for device #{} (returnToIdle={}). Call devkit_get_trace_log after the next frame.",
-          device_index,
-          trace_return_to_idle.load() ? "true" : "false"),
-      .structured_content = json{
-          {"deviceIndex", device_index},
-          {"queued", true},
-          {"returnToIdle", trace_return_to_idle.load()},
-      },
-  };
-}
-
-[[nodiscard]] bool SuspendLiveShadersForAb(reshade::api::device* device) {
-  auto* device_data = renodx::utils::data::Get<DeviceData>(device);
-  if (device_data == nullptr) return false;
-
-  std::unique_lock device_lock(device_data->mutex);
-  device_data->suspended_ab_live_shaders.clear();
-  for (const auto& [shader_hash, details] : device_data->shader_details) {
-    if (details.shader_source == ShaderDetails::ShaderSource::DISK_SHADER
-        && details.disk_shader.has_value()
-        && !details.disk_shader->removed
-        && details.disk_shader->IsCompilationOK()) {
-      device_data->suspended_ab_live_shaders.emplace_back(shader_hash, details.disk_shader->GetCompilationData());
-    }
-  }
-  if (device_data->suspended_ab_live_shaders.empty()) {
-    return false;
-  }
-
-  for (const auto& [shader_hash, bytecode] : device_data->suspended_ab_live_shaders) {
-    (void)bytecode;
-    renodx::utils::shader::RemoveRuntimeReplacements(device, {shader_hash});
-  }
-  return true;
-}
-
-void RestoreLiveShadersForAb(reshade::api::device* device) {
-  auto* device_data = renodx::utils::data::Get<DeviceData>(device);
-  if (device_data == nullptr) return;
-
-  std::unique_lock device_lock(device_data->mutex);
-  for (const auto& [shader_hash, bytecode] : device_data->suspended_ab_live_shaders) {
-    renodx::utils::shader::AddRuntimeReplacement(device, shader_hash, bytecode);
-  }
-  device_data->suspended_ab_live_shaders.clear();
-}
-
-// Caller must hold device_data->mutex (shared or unique).
-[[nodiscard]] devkit_device_proxy::DeviceProxyState BuildDeviceProxyStateForDevice(
-    uint32_t device_index,
-    DeviceData* device_data) {
-  const auto output_mode = ResolveDeviceProxyOutputModeConfig();
-  const bool shared_proxy_active = IsSharedDeviceProxyActive();
-  const bool teardown_pending =
-      renodx::utils::device_proxy::shared.data != nullptr
-      && renodx::utils::device_proxy::shared.data->remove_device_proxy.load(std::memory_order_relaxed);
-  const bool is_enabled = IsDevkitDeviceProxyModeEnabled() && shared_proxy_active;
-  const bool route_forced = IsDeviceProxySeparateHwndForced(device_data);
-  const auto active_route = ResolveEffectiveDeviceProxyHwndRoute(device_data);
-  const bool is_d3d9 = (device_data->device != nullptr
-                        && device_data->device->get_api() == reshade::api::device_api::d3d9);
-  const bool is_d3d9_ex = (!is_d3d9 || device_data->is_d3d9_ex);
-
-  std::string mode_name = "none";
-  switch (setting_device_proxy_mode) {
-    case DeviceProxyMode::CURRENT_WINDOW:
-      mode_name = "current_window";
-      break;
-    case DeviceProxyMode::NEW_WINDOW:
-      mode_name = "new_window";
-      break;
-    default:
-      break;
-  }
-
-  std::string output_mode_name = "scrgb";
-  switch (setting_device_proxy_output_mode) {
-    case 0u:
-      output_mode_name = "srgb";
-      break;
-    case 1u:
-      output_mode_name = "hdr10";
-      break;
-    default:
-      break;
-  }
-
-  std::string state_name = "disabled";
-  if (teardown_pending) {
-    state_name = "tearing_down";
-  } else if (shared_proxy_active) {
-    state_name = "enabled";
-  }
-
-  std::string dx9_upgrade_state = "inactive";
-  if (renodx::utils::device_upgrade::shared.data != nullptr) {
-    if (renodx::utils::device_upgrade::shared.data->dx9ex_upgrade_applied.load(std::memory_order_relaxed)) {
-      dx9_upgrade_state = "applied";
-    } else if (renodx::utils::device_upgrade::shared.data->dx9ex_upgrade_requested.load(std::memory_order_relaxed)) {
-      dx9_upgrade_state = "requested";
-    }
-  }
-
-  return devkit_device_proxy::DeviceProxyState{
-      .device_index = device_index,
-      .api = device_data->device != nullptr ? StreamToString(device_data->device->get_api()) : "unknown",
-      .mode = std::move(mode_name),
-      .output_mode = std::move(output_mode_name),
-      .output_mode_index = setting_device_proxy_output_mode,
-      .target_format = StreamToString(output_mode.target_format),
-      .intermediate_format = StreamToString(output_mode.intermediate_format),
-      .target_color_space = StreamToString(output_mode.target_color_space),
-      .state = std::move(state_name),
-      .shared_proxy_active = shared_proxy_active,
-      .teardown_pending = teardown_pending,
-      .reenable_pending = g_device_proxy_reenable_pending,
-      .external_proxy_active = shared_proxy_active && !IsDevkitDeviceProxyModeEnabled(),
-      .hwnd_route = (active_route == DeviceProxyHwndRoute::SAME_HWND) ? "same_hwnd" : "separate_hwnd",
-      .separate_hwnd_forced = route_forced,
-      .mode_locked = is_enabled && (active_route == DeviceProxyHwndRoute::SAME_HWND),
-      .proxy_device_ready = renodx::utils::device_proxy::proxy_device_reshade != nullptr,
-      .proxy_swapchain_ready = renodx::utils::device_proxy::proxy_swap_chain != nullptr,
-      .proxy_hwnd_override = FormatHandle(renodx::utils::device_proxy::local_proxy_swapchain_hwnd_override),
-      .output_window_created = g_device_proxy_output_window != nullptr,
-      .primary_swapchain_is_flip = device_data->primary_swapchain_is_flip,
-      .is_d3d9 = is_d3d9,
-      .is_d3d9_ex = device_data->is_d3d9_ex,
-      .controls_blocked = is_d3d9 && !is_d3d9_ex,
-      .dx9_ex_upgrade_state = std::move(dx9_upgrade_state),
-      .proxy_wait_idle = renodx::utils::device_proxy::device_proxy_wait_idle_destination,
-      .force_dx9_ex = setting_device_proxy_force_dx9_ex,
-      .force_disable_flip = setting_device_proxy_force_disable_flip,
-      .use_custom_shaders = setting_device_proxy_use_custom_shaders,
-      .custom_shaders_ready = (!setting_device_proxy_vertex_shader_blob.empty()
-                               && !setting_device_proxy_pixel_shader_blob.empty()),
-      .custom_vertex_shader_bytes = setting_device_proxy_vertex_shader_blob.size(),
-      .custom_pixel_shader_bytes = setting_device_proxy_pixel_shader_blob.size(),
-      .custom_shader_compile_error = setting_device_proxy_compile_error.empty()
-                                         ? std::nullopt
-                                         : std::optional<std::string>(setting_device_proxy_compile_error),
-      .custom_vertex_shader_file = DEVICE_PROXY_VERTEX_SHADER_FILENAME,
-      .custom_pixel_shader_file = DEVICE_PROXY_PIXEL_SHADER_FILENAME,
-  };
-}
-
-[[nodiscard]] devkit_device_proxy::DeviceProxyState GetDeviceProxyStateForMcp(uint32_t device_index) {
-  std::shared_lock list_lock(device_data_list_mutex);
-  if (device_index >= device_data_list.size()) {
-    throw std::runtime_error(std::format("Device #{} is not available.", device_index));
-  }
-  auto* device_data = device_data_list[device_index];
-  std::shared_lock device_lock(device_data->mutex);
-  return BuildDeviceProxyStateForDevice(device_index, device_data);
-}
-
-[[nodiscard]] bool EnqueuePendingDeviceProxyRequest(
-    uint32_t device_index,
-    const std::shared_ptr<devkit_device_proxy::PendingDeviceProxyRequest>& request) {
-  std::shared_lock list_lock(device_data_list_mutex);
-  if (device_index >= device_data_list.size()) {
-    return false;
-  }
-  auto* device_data = device_data_list[device_index];
-  std::unique_lock device_lock(device_data->mutex);
-  device_data->pending_device_proxy_requests.push_back(request);
-  return true;
-}
-
-void CancelPendingDeviceProxyRequest(
-    uint32_t device_index,
-    const std::shared_ptr<devkit_device_proxy::PendingDeviceProxyRequest>& request) {
-  std::shared_lock list_lock(device_data_list_mutex);
-  if (device_index >= device_data_list.size()) {
-    return;
-  }
-  auto* device_data = device_data_list[device_index];
-  std::unique_lock device_lock(device_data->mutex);
-  std::erase(device_data->pending_device_proxy_requests, request);
-}
-
-void ProcessPendingDeviceProxyRequests(
-    const std::deque<std::shared_ptr<devkit_device_proxy::PendingDeviceProxyRequest>>& requests,
-    uint32_t device_index,
-    DeviceData* device_data) {
-  for (const auto& request : requests) {
-    {
-      std::scoped_lock request_lock(request->mutex);
-      if (request->completed || request->canceled) {
-        request->completed = true;
-        request->cv.notify_all();
-        continue;
-      }
-      request->started = true;
-    }
-    request->cv.notify_all();
-
-    ToolResult result = {};
-    try {
-      std::unique_lock device_lock(device_data->mutex);
-      const auto& params = request->params;
-      bool changed = false;
-
-      if (params.force_dx9_ex.has_value()) {
-        setting_device_proxy_force_dx9_ex = params.force_dx9_ex.value();
-        reshade::set_config_value(
-            nullptr,
-            "renodx-dev",
-            "SwapChainDeviceProxyForceDX9Ex",
-            setting_device_proxy_force_dx9_ex);
-      }
-      if (params.force_disable_flip.has_value()) {
-        setting_device_proxy_force_disable_flip = params.force_disable_flip.value();
-        reshade::set_config_value(
-            nullptr,
-            "renodx-dev",
-            "SwapChainDeviceProxyForceDisableFlip",
-            setting_device_proxy_force_disable_flip);
-      }
-
-      const bool has_runtime_change =
-          params.mode.has_value()
-          || params.output_mode.has_value()
-          || params.proxy_wait_idle.has_value()
-          || params.use_custom_shaders.has_value()
-          || params.compile_custom_shaders.value_or(false);
-
-      const bool is_d3d9_device = (device_data->device != nullptr
-                                   && device_data->device->get_api() == reshade::api::device_api::d3d9);
-      const bool dx9_proxy_controls_blocked = (is_d3d9_device && !device_data->is_d3d9_ex);
-
-      if (has_runtime_change && dx9_proxy_controls_blocked) {
-        const auto state = BuildDeviceProxyStateForDevice(device_index, device_data);
-        json payload = state;
-        payload["error"] = "Device Proxy controls are unavailable on D3D9 (non-Ex). Enable forceDx9Ex and restart the game.";
-        result = ToolResult{
-            .text = "Device Proxy controls are unavailable on D3D9 (non-Ex). Enable forceDx9Ex and restart the game.",
-            .structured_content = std::move(payload),
-            .is_error = true,
-        };
-      } else if (has_runtime_change) {
-        if (params.proxy_wait_idle.has_value()) {
-          renodx::utils::device_proxy::device_proxy_wait_idle_destination = params.proxy_wait_idle.value();
-          reshade::set_config_value(
-              nullptr,
-              "renodx-dev",
-              "SwapChainDeviceProxyProxyWaitIdle",
-              params.proxy_wait_idle.value());
-          changed = true;
-        }
-        if (params.use_custom_shaders.has_value()) {
-          setting_device_proxy_use_custom_shaders = params.use_custom_shaders.value();
-          reshade::set_config_value(
-              nullptr,
-              "renodx-dev",
-              "SwapChainDeviceProxyUseCustomShaders",
-              setting_device_proxy_use_custom_shaders);
-          changed = true;
-        }
-
-        bool compile_failed = false;
-        std::string compile_error;
-        if (params.compile_custom_shaders.value_or(false)) {
-          if (CompileDeviceProxyShadersFromFiles(&compile_error)) {
-            changed = true;
-          } else {
-            compile_failed = true;
-          }
-        }
-
-        if (compile_failed) {
-          const auto state = BuildDeviceProxyStateForDevice(device_index, device_data);
-          json payload = state;
-          payload["error"] = compile_error;
-          result = ToolResult{
-              .text = std::format("Failed to compile custom device proxy shaders: {}", compile_error),
-              .structured_content = std::move(payload),
-              .is_error = true,
-          };
-        } else {
-          const bool shared_proxy_active = IsSharedDeviceProxyActive();
-          const bool is_enabled = IsDevkitDeviceProxyModeEnabled() && shared_proxy_active;
-          const bool route_forced = IsDeviceProxySeparateHwndForced(device_data);
-          const auto active_route = ResolveEffectiveDeviceProxyHwndRoute(device_data);
-          const bool mode_locked = (is_enabled && active_route == DeviceProxyHwndRoute::SAME_HWND);
-
-          bool output_mode_changed = false;
-          if (params.output_mode.has_value()) {
-            uint32_t new_output_mode = 2u;
-            if (params.output_mode.value() == "srgb") {
-              new_output_mode = 0u;
-            } else if (params.output_mode.value() == "hdr10") {
-              new_output_mode = 1u;
-            }
-            if (new_output_mode != setting_device_proxy_output_mode) {
-              setting_device_proxy_output_mode = new_output_mode;
-              reshade::set_config_value(
-                  nullptr,
-                  "renodx-dev",
-                  "SwapChainDeviceProxyOutputMode",
-                  setting_device_proxy_output_mode);
-              output_mode_changed = true;
-              changed = true;
-            }
-          }
-
-          bool rejected = false;
-          std::string reject_reason;
-          bool handled_teardown_or_enable = false;
-
-          if (params.mode.has_value()) {
-            DeviceProxyMode target_mode = DeviceProxyMode::NONE;
-            if (params.mode.value() == "current_window") {
-              target_mode = DeviceProxyMode::CURRENT_WINDOW;
-            } else if (params.mode.value() == "new_window") {
-              target_mode = DeviceProxyMode::NEW_WINDOW;
-            }
-
-            if (target_mode != setting_device_proxy_mode) {
-              if (mode_locked) {
-                rejected = true;
-                reject_reason = "Current Window proxy mode is locked for this session.";
-              } else if (target_mode == DeviceProxyMode::CURRENT_WINDOW && route_forced) {
-                rejected = true;
-                reject_reason = "current_window mode is unavailable on flip swapchains. Use new_window instead.";
-              } else if (target_mode == DeviceProxyMode::NONE) {
-                setting_device_proxy_mode = DeviceProxyMode::NONE;
-                if (is_enabled) {
-                  renodx::utils::device_proxy::SetProxyRemovePending(true);
-                  g_device_proxy_reenable_pending = false;
-                  handled_teardown_or_enable = true;
-                }
-                changed = true;
-              } else {
-                setting_device_proxy_mode = target_mode;
-                if (is_enabled) {
-                  ApplyDeviceProxySettings();
-                  renodx::utils::device_proxy::SetProxyRemovePending(true);
-                  g_device_proxy_reenable_pending = true;
-                  handled_teardown_or_enable = true;
-                } else if (renodx::utils::device_proxy::shared.data != nullptr
-                           && renodx::utils::device_proxy::shared.data->remove_device_proxy.load(std::memory_order_relaxed)) {
-                  ApplyDeviceProxySettings();
-                  g_device_proxy_reenable_pending = true;
-                  handled_teardown_or_enable = true;
-                } else {
-                  if (!PrepareDeviceProxyActivation(device_data)) {
-                    setting_device_proxy_mode = DeviceProxyMode::NONE;
-                    renodx::utils::device_proxy::SetProxyRemovePending(false);
-                    renodx::utils::device_proxy::SetProxyEnabled(false);
-                    g_device_proxy_reenable_pending = false;
-                    g_device_proxy_active_hwnd_route.reset();
-                    rejected = true;
-                    reject_reason = "Failed to prepare device proxy activation (output window creation failed).";
-                  } else {
-                    ApplyDeviceProxySettings();
-                    renodx::utils::device_proxy::SetProxyRemovePending(false);
-                    renodx::utils::device_proxy::SetProxyEnabled(true);
-                    g_device_proxy_reenable_pending = false;
-                    handled_teardown_or_enable = true;
-                  }
-                }
-              }
-            }
-          }
-
-          if (rejected) {
-            const auto state = BuildDeviceProxyStateForDevice(device_index, device_data);
-            json payload = state;
-            payload["error"] = reject_reason;
-            result = ToolResult{
-                .text = reject_reason,
-                .structured_content = std::move(payload),
-                .is_error = true,
-            };
-          } else {
-            if (!handled_teardown_or_enable && output_mode_changed && is_enabled && IsDevkitDeviceProxyModeEnabled()) {
-              ApplyDeviceProxySettings();
-              renodx::utils::device_proxy::SetProxyRemovePending(true);
-              g_device_proxy_reenable_pending = true;
-            } else if (!handled_teardown_or_enable && changed) {
-              ApplyDeviceProxySettings();
-            }
-
-            const auto state = BuildDeviceProxyStateForDevice(device_index, device_data);
-            result = ToolResult{
-                .text = std::format(
-                    "Updated swapchain proxy on device #{}: state={}, mode={}, outputMode={}, target={} / {}.",
-                    device_index,
-                    state.state,
-                    state.mode,
-                    state.output_mode,
-                    state.target_format,
-                    state.target_color_space),
-                .structured_content = state,
-            };
-          }
-        }
-      } else {
-        const auto state = BuildDeviceProxyStateForDevice(device_index, device_data);
-        result = ToolResult{
-            .text = std::format(
-                "Updated swapchain proxy boot compatibility settings on device #{} (forceDx9Ex={}, forceDisableFlip={}; restart required).",
-                device_index,
-                state.force_dx9_ex ? "true" : "false",
-                state.force_disable_flip ? "true" : "false"),
-            .structured_content = state,
-        };
-      }
-    } catch (const std::exception& exception) {
-      result = ToolResult{
-          .text = exception.what(),
-          .structured_content = json{{"error", exception.what()}},
-          .is_error = true,
-      };
-    } catch (...) {
-      result = ToolResult{
-          .text = "Unhandled device proxy request failure.",
-          .structured_content = json{{"error", "Unhandled device proxy request failure."}},
-          .is_error = true,
-      };
-    }
-
-    {
-      std::scoped_lock request_lock(request->mutex);
-      request->result = std::move(result);
-      request->completed = true;
-    }
-    request->cv.notify_all();
-  }
-}
-
-[[nodiscard]] devkit_upgrade_candidates::UpgradeAnalysisInput BuildUpgradeAnalysisInputForMcp(uint32_t device_index) {
-  auto graph = BuildSnapshotGraphForMcp(device_index);
-
-  devkit_upgrade_candidates::UpgradeAnalysisInput analysis = {
-      .device_index = device_index,
-      .graph = std::move(graph),
-  };
-
-  reshade::api::device* device = nullptr;
-  std::unordered_set<uint64_t> backbuffer_set(
-      analysis.graph.backbuffer_handles.begin(),
-      analysis.graph.backbuffer_handles.end());
-  std::unordered_set<uint64_t> hdr10_backbuffer_set;
-
-  {
-    std::shared_lock list_lock(device_data_list_mutex);
-    if (device_index >= device_data_list.size()) {
-      throw std::runtime_error(std::format("Device #{} is not available.", device_index));
-    }
-    auto* device_data = device_data_list[device_index];
-    std::shared_lock device_lock(device_data->mutex);
-    device = device_data->device;
-    analysis.api = device != nullptr ? StreamToString(device->get_api()) : "unknown";
-
-    if (device_data->primary_swapchain_desc.has_value()) {
-      analysis.backbuffer_desc = device_data->primary_swapchain_desc->back_buffer;
-      analysis.backbuffer_format = StreamToString(analysis.backbuffer_desc.texture.format);
-    }
-    reshade::api::color_space primary_cs = reshade::api::color_space::unknown;
-    if (device_data->primary_swapchain != nullptr) {
-      if (const auto rt_it = device_data->swapchain_runtime_info.find(device_data->primary_swapchain);
-          rt_it != device_data->swapchain_runtime_info.end()) {
-        primary_cs = rt_it->second.color_space;
-      }
-    } else if (!device_data->swapchain_runtime_info.empty()) {
-      primary_cs = device_data->swapchain_runtime_info.begin()->second.color_space;
-    }
-    analysis.backbuffer_color_space = StreamToString(primary_cs);
-    analysis.backbuffer_is_hdr =
-        (primary_cs == reshade::api::color_space::extended_srgb_linear
-         || primary_cs == reshade::api::color_space::hdr10_st2084
-         || primary_cs == reshade::api::color_space::hdr10_hlg);
-
-    for (const auto& [swapchain_ptr, rt_info] : device_data->swapchain_runtime_info) {
-      (void)swapchain_ptr;
-      if (rt_info.color_space != reshade::api::color_space::hdr10_st2084
-          && rt_info.color_space != reshade::api::color_space::hdr10_hlg) {
-        continue;
-      }
-      for (const auto bb_handle : rt_info.backbuffer_handles) {
-        if (bb_handle != 0u) {
-          hdr10_backbuffer_set.insert(bb_handle);
-        }
-      }
-    }
-
-    for (size_t index = 0u; index < device_data->draw_details_list.size(); ++index) {
-      const auto& draw = device_data->draw_details_list[index];
-      if (draw.copy_source.handle != 0u && draw.copy_destination.handle != 0u) {
-        analysis.copy_operations.push_back(devkit_upgrade_candidates::CopyOperationRecord{
-            .draw_index = static_cast<uint32_t>(index),
-            .method = draw.DrawMethodString(),
-            .source_handle = draw.copy_source.handle,
-            .destination_handle = draw.copy_destination.handle,
-        });
-      }
-    }
-  }
-
-  // Snapshot POD metadata from utils::resource without holding device_data->mutex
-  // or doing string formatting while inside resource_infos submap locks.
-  struct RawTextureMeta {
-    uint64_t handle = 0u;
-    reshade::api::resource_desc desc = {};
-    bool is_swap_chain = false;
-    bool clone_enabled = false;
-  };
-  std::vector<RawTextureMeta> raw_textures;
-  renodx::utils::resource::ForEachResourceInfo([&](const auto& info) {
-    if (info.device != device) return;
-    if (info.destroyed || info.is_clone) return;
-    if (info.desc.type == reshade::api::resource_type::unknown
-        || info.desc.type == reshade::api::resource_type::buffer) {
-      return;
-    }
-    raw_textures.push_back(RawTextureMeta{
-        .handle = info.resource.handle,
-        .desc = info.desc,
-        .is_swap_chain = info.is_swap_chain,
-        .clone_enabled = info.clone_enabled,
-    });
-  });
-
-  analysis.resources_by_handle.reserve(raw_textures.size());
-  for (const auto& raw : raw_textures) {
-    analysis.resources_by_handle[raw.handle] = devkit_upgrade_candidates::TrackedResourceMeta{
-        .resource_handle = raw.handle,
-        .resource_handle_hex = FormatHandle(raw.handle),
-        .type = StreamToString(raw.desc.type),
-        .desc = raw.desc,
-        .format_name = StreamToString(raw.desc.texture.format),
-        .is_backbuffer = raw.is_swap_chain || backbuffer_set.contains(raw.handle),
-        .is_hdr10_backbuffer = hdr10_backbuffer_set.contains(raw.handle),
-        .clone_enabled = raw.clone_enabled,
-    };
-  }
-
-  return analysis;
-}
-
-[[nodiscard]] json BuildShaderSnapshotContextForMcp(uint32_t device_index, uint32_t shader_hash) {
-  std::shared_lock list_lock(device_data_list_mutex);
-  if (device_index >= device_data_list.size()) {
-    throw std::runtime_error(std::format("Device #{} is not available.", device_index));
-  }
-  auto* device_data = device_data_list[device_index];
-  std::shared_lock device_lock(device_data->mutex);
-
-  json draw_indices_json = json::array();
-  size_t total_draw_count = 0u;
-  std::vector<uint32_t> matched_draws;
-  if (const auto it = device_data->shader_draw_indexes.find(shader_hash);
-      it != device_data->shader_draw_indexes.end()) {
-    total_draw_count = it->second.size();
-    for (const auto draw_idx : it->second) {
-      matched_draws.push_back(draw_idx);
-      if (draw_indices_json.size() < 64u) {
-        draw_indices_json.push_back(draw_idx);
-      }
-    }
-  }
-
-  const auto format_resource_binding = [](
-      std::string label,
-      uint32_t slot,
-      uint32_t space,
-      const ResourceViewDetails& details) {
-    const bool is_buffer = (details.resource_desc.type == reshade::api::resource_type::buffer);
-    const auto fmt = (details.resource_view_desc.format != reshade::api::format::unknown)
-                         ? details.resource_view_desc.format
-                         : details.resource_desc.texture.format;
-    const auto type_str = StreamToString(details.resource_desc.type);
-    const auto fmt_str = is_buffer ? std::string("buffer") : StreamToString(fmt);
-    std::string summary;
-    if (is_buffer) {
-      summary = std::format("buffer ({} bytes)", details.resource_desc.buffer.size);
-    } else if (details.resource_desc.type == reshade::api::resource_type::texture_3d) {
-      summary = std::format(
-          "{} {}x{}x{} {}",
-          type_str,
-          details.resource_desc.texture.width,
-          details.resource_desc.texture.height,
-          details.resource_desc.texture.depth_or_layers,
-          fmt_str);
-    } else {
-      summary = std::format(
-          "{} {}x{} {}",
-          type_str,
-          details.resource_desc.texture.width,
-          details.resource_desc.texture.height,
-          fmt_str);
-    }
-    return json{
-        {"label", std::move(label)},
-        {"slot", slot},
-        {"space", space},
-        {"resourceHandle", FormatHandle(details.resource.handle)},
-        {"resourceViewHandle", FormatHandle(details.resource_view.handle)},
-        {"type", type_str},
-        {"format", fmt_str},
-        {"width", is_buffer ? 0u : details.resource_desc.texture.width},
-        {"height", is_buffer ? 0u : details.resource_desc.texture.height},
-        {"depthOrLayers", is_buffer ? 0u : details.resource_desc.texture.depth_or_layers},
-        {"isBackbuffer", details.is_swapchain},
-        {"summary", std::move(summary)},
-    };
-  };
-
-  json srvs = json::array();
-  json uavs = json::array();
-  json rtvs = json::array();
-  json cbvs = json::array();
-  std::optional<uint32_t> representative_draw = std::nullopt;
-  if (!matched_draws.empty() && matched_draws.front() < device_data->draw_details_list.size()) {
-    representative_draw = matched_draws.front();
-    const auto& draw = device_data->draw_details_list[representative_draw.value()];
-    for (const auto& [slot_space, srv] : draw.srv_binds) {
-      if (srv.resource.handle == 0u) continue;
-      if (draw.resource_binds.has_value()
-          && !IsResourceBindUsedByShader(draw.resource_binds, ResourceBind::BindType::SRV, slot_space.first, slot_space.second)) {
-        continue;
-      }
-      srvs.push_back(format_resource_binding(
-          std::format("t{}", slot_space.first),
-          slot_space.first,
-          slot_space.second,
-          srv));
-    }
-    for (const auto& [slot_space, uav] : draw.uav_binds) {
-      if (uav.resource.handle == 0u) continue;
-      if (draw.resource_binds.has_value()
-          && !IsResourceBindUsedByShader(draw.resource_binds, ResourceBind::BindType::UAV, slot_space.first, slot_space.second)) {
-        continue;
-      }
-      uavs.push_back(format_resource_binding(
-          std::format("u{}", slot_space.first),
-          slot_space.first,
-          slot_space.second,
-          uav));
-    }
-    for (const auto& [rtv_index, rtv] : draw.render_targets) {
-      if (rtv.resource.handle == 0u) continue;
-      rtvs.push_back(format_resource_binding(
-          std::format("rtv{}", rtv_index),
-          rtv_index,
-          0u,
-          rtv));
-    }
-    for (const auto& [slot_space, cb] : draw.constants) {
-      if (cb.buffer.handle == 0u) continue;
-      if (draw.resource_binds.has_value()
-          && !IsResourceBindUsedByShader(draw.resource_binds, ResourceBind::BindType::CBV, slot_space.first, slot_space.second)) {
-        continue;
-      }
-      cbvs.push_back(json{
-          {"label", std::format("cb{}", slot_space.first)},
-          {"slot", slot_space.first},
-          {"space", slot_space.second},
-          {"bufferHandle", FormatHandle(cb.buffer.handle)},
-          {"offset", cb.offset},
-          {"size", cb.size == UINT64_MAX ? json(nullptr) : json(cb.size)},
-          {"fullRange", cb.size == UINT64_MAX},
-      });
-    }
-  }
-
-  return json{
-      {"drawCount", total_draw_count},
-      {"drawIndices", draw_indices_json},
-      {"representativeDrawIndex", representative_draw.has_value() ? json(representative_draw.value()) : json(nullptr)},
-      {"bindings", {
-                       {"srvs", srvs},
-                       {"uavs", uavs},
-                       {"renderTargets", rtvs},
-                       {"constantBuffers", cbvs},
-                   }},
-  };
-}
-
 [[nodiscard]] devkit_snapshot_tools::ToolContext BuildSnapshotToolsContext() {
   return devkit_snapshot_tools::ToolContext{
       .get_device_count = []() {
@@ -5614,12 +3991,6 @@ void ProcessPendingDeviceProxyRequests(
       .set_selected_device_index = [](uint32_t device_index) { device_data_index.store(device_index, std::memory_order_relaxed); },
       .get_pipe_name = []() { return NarrowAscii(devkit_mcp_session.server.GetPipeName()); },
       .is_connected = []() { return devkit_mcp_session.server.IsConnected(); },
-      .get_tracking_state = GetTrackingStateSummaryForMcp,
-      .set_tracking_active = [](bool active) {
-        snapshot_return_to_idle.store(false);
-        bypass_forced_tracking.store(false);  // an explicit choice wins over the bypass auto-toggle
-        devkit_tracking_requested.store(active);
-        return GetTrackingStateSummaryForMcp(); },
       .has_active_snapshot = []() { return snapshot_device != nullptr; },
       .has_queued_snapshot = []() { return snapshot_queued_device != nullptr; },
       .is_snapshot_active = [](uint32_t device_index) {
@@ -5636,9 +4007,6 @@ void ProcessPendingDeviceProxyRequests(
           throw std::runtime_error(std::format("Device #{} is not available.", device_index));
         }
         return BuildDeviceSummary(device_index, device_data_list[device_index], is_selected); },
-      .get_swapchain_info = BuildSwapchainInfoForMcp,
-      .list_resources = ListTrackedResourcesForMcp,
-      .set_shader_bypass = SetShaderBypassForMcp,
       .list_shaders = [](uint32_t device_index, const std::optional<std::string>& stage_filter) {
         std::shared_lock list_lock(device_data_list_mutex);
         if (device_index >= device_data_list.size()) return std::vector<devkit_shader_summary::TrackedShaderSummary>{};
@@ -5678,16 +4046,10 @@ void ProcessPendingDeviceProxyRequests(
         auto* device_data = device_data_list[device_index];
 
         std::shared_lock device_lock(device_data->mutex);
-        const uint32_t bb_w = device_data->primary_swapchain_desc.has_value()
-                                  ? device_data->primary_swapchain_desc->back_buffer.texture.width
-                                  : 0u;
-        const uint32_t bb_h = device_data->primary_swapchain_desc.has_value()
-                                  ? device_data->primary_swapchain_desc->back_buffer.texture.height
-                                  : 0u;
         std::vector<devkit_draw_summary::DrawSummary> draws;
         draws.reserve(device_data->draw_details_list.size());
         for (size_t index = 0; index < device_data->draw_details_list.size(); ++index) {
-          draws.push_back(BuildDrawSummary(index, device_data->draw_details_list[index], false, bb_w, bb_h));
+          draws.push_back(BuildDrawSummary(index, device_data->draw_details_list[index], false));
         }
         return draws; },
       .get_draw = [](uint32_t device_index, uint32_t draw_index) {
@@ -5701,14 +4063,8 @@ void ProcessPendingDeviceProxyRequests(
         if (draw_index >= device_data->draw_details_list.size()) {
           throw std::runtime_error(std::format("drawIndex {} is out of range.", draw_index));
         }
-        const uint32_t bb_w = device_data->primary_swapchain_desc.has_value()
-                                  ? device_data->primary_swapchain_desc->back_buffer.texture.width
-                                  : 0u;
-        const uint32_t bb_h = device_data->primary_swapchain_desc.has_value()
-                                  ? device_data->primary_swapchain_desc->back_buffer.texture.height
-                                  : 0u;
 
-        return BuildDrawSummary(draw_index, device_data->draw_details_list[draw_index], true, bb_w, bb_h); },
+        return BuildDrawSummary(draw_index, device_data->draw_details_list[draw_index], true); },
       .build_snapshot_summary = [](uint32_t device_index) {
         std::shared_lock list_lock(device_data_list_mutex);
         if (device_index >= device_data_list.size()) {
@@ -5728,10 +4084,8 @@ void ProcessPendingDeviceProxyRequests(
             .shader_usage_entries = device_data->shader_draw_indexes.size(),
             .snapshot_rows = device_data->snapshot_rows.size(),
             .snapshot_rows_valid = device_data->snapshot_rows_valid,
-            .snapshot_capture_count = device_data->snapshot_capture_count,
-            .snapshot_captured_at_ms = device_data->snapshot_captured_at_ms,
         }; },
-      .queue_snapshot = [](uint32_t device_index, std::optional<bool> return_to_idle) {
+      .queue_snapshot = [](uint32_t device_index) {
         std::shared_lock list_lock(device_data_list_mutex);
         if (device_index >= device_data_list.size()) {
           const auto error = std::format("Device #{} is not available.", device_index);
@@ -5786,7 +4140,7 @@ void ProcessPendingDeviceProxyRequests(
           };
         }
 
-        QueueSnapshotCapture(device, return_to_idle);
+        QueueSnapshotCapture(device);
         return ToolResult{
             .text = snapshot_trace_with_snapshot.load()
                         ? std::format("Queued a snapshot capture and trace for device #{}.", device_index)
@@ -5796,7 +4150,6 @@ void ProcessPendingDeviceProxyRequests(
                 {"queued", true},
                 {"active", false},
                 {"traceQueued", snapshot_trace_with_snapshot.load()},
-                {"returnToIdle", snapshot_return_to_idle.load()},
             },
         }; },
   };
@@ -5805,38 +4158,11 @@ void ProcessPendingDeviceProxyRequests(
 void RegisterDevkitMcpTools(renodx::utils::mcp::Server& server) {
   const devkit_mcp_runtime::RegistrationContext context = {
       .build_snapshot_tools_context = BuildSnapshotToolsContext,
-      .build_output_chain_tool_context = []() { return devkit_output_chain::ToolContext{
-                                                    .resolve_device_index = BuildResolveDeviceIndexCallback(),
-                                                    .capture_snapshot_graph = BuildSnapshotGraphForMcp,
-                                                    .get_disassembly = [](uint32_t device_index, uint32_t shader_hash) {
-                                                      auto section = BuildMcpShaderDisassemblySection(device_index, shader_hash);
-                                                      return section.available ? std::move(section.text) : std::string();
-                                                    },
-                                                }; },
-      .build_upgrade_candidates_tool_context = []() { return devkit_upgrade_candidates::ToolContext{
-                                                          .resolve_device_index = BuildResolveDeviceIndexCallback(),
-                                                          .capture_upgrade_analysis_input = BuildUpgradeAnalysisInputForMcp,
-                                                      }; },
-      .build_device_proxy_tool_context = []() { return devkit_device_proxy::ToolContext{
-                                                    .resolve_device_index = BuildResolveDeviceIndexCallback(),
-                                                    .get_state = GetDeviceProxyStateForMcp,
-                                                    .enqueue_update_request = EnqueuePendingDeviceProxyRequest,
-                                                    .cancel_update_request = CancelPendingDeviceProxyRequest,
-                                                }; },
-      .build_deep_analysis_tool_context = []() { return devkit_deep_analysis::ToolContext{
-                                                     .resolve_device_index = BuildResolveDeviceIndexCallback(),
-                                                     .prepare_constants_request = PrepareConstantsRequestForMcp,
-                                                     .enqueue_constants_request = EnqueuePendingConstantsRequest,
-                                                     .cancel_constants_request = CancelPendingConstantsRequest,
-                                                     .capture_snapshot_profile = BuildSnapshotProfileForMcp,
-                                                     .queue_trace = QueueTraceForMcp,
-                                                 }; },
       .build_shader_inspection_tool_context = []() { return devkit_shader_inspection::ToolContext{
                                                          .resolve_device_index = BuildResolveDeviceIndexCallback(),
                                                          .get_shader_summary = BuildTrackedShaderSummaryForDevice,
                                                          .get_disassembly = BuildMcpShaderDisassemblySection,
                                                          .get_decompilation = BuildMcpShaderDecompilationSection,
-                                                         .get_snapshot_context = BuildShaderSnapshotContextForMcp,
                                                      }; },
       .build_live_shaders_tool_context = []() { return devkit_live_shaders::ToolContext{
                                                     .resolve_device_index = BuildResolveDeviceIndexCallback(),
@@ -5844,13 +4170,11 @@ void RegisterDevkitMcpTools(renodx::utils::mcp::Server& server) {
                                                     .set_live_shader_path = SetLiveShaderPathForMcp,
                                                     .load_live_shaders = LoadLiveShadersForMcp,
                                                     .unload_live_shaders = UnloadLiveShadersForMcp,
-                                                    .get_live_shader_status = GetLiveShaderStatusForMcp,
                                                 }; },
       .build_analyze_resource_tool_context = []() { return devkit_resource_analysis::ToolContext{
                                                         .resolve_device_index = BuildResolveDeviceIndexCallback(),
                                                         .enqueue_request = EnqueuePendingResourceAnalysisRequest,
                                                         .cancel_request = CancelPendingResourceAnalysisRequest,
-                                                        .resolve_scan_targets = ResolveBatchScanTargetsForMcp,
                                                     }; },
       .build_resource_clone_tool_context = []() { return devkit_resource_clone::ToolContext{
                                                       .resolve_device_index = BuildResolveDeviceIndexCallback(),
@@ -5967,19 +4291,6 @@ void OnDestroyDevice(reshade::api::device* device) {
     devkit_primary_device_api.store(0u, std::memory_order_release);
   }
   std::unique_lock device_lock(device_data->mutex);
-  for (const auto& request : device_data->pending_device_proxy_requests) {
-    {
-      std::scoped_lock request_lock(request->mutex);
-      request->result = ToolResult{
-          .text = "Device was destroyed before device proxy update completed.",
-          .structured_content = json{{"error", "Device was destroyed before device proxy update completed."}},
-          .is_error = true,
-      };
-      request->completed = true;
-    }
-    request->cv.notify_all();
-  }
-  device_data->pending_device_proxy_requests.clear();
   renodx::utils::data::Delete<DeviceData>(device);
 }
 
@@ -6046,149 +4357,6 @@ bool OnCreateSwapchain(reshade::api::swapchain_desc& desc, void* hwnd) {
   return changed;
 }
 
-// Records what the game sends through IDXGISwapChain4::SetHDRMetaData. ReShade has no event for it, so the DXGI
-// implementation is hooked once; ReShade's swapchain proxy forwards the call to it.
-namespace hdr_metadata_hook {
-using SetHdrMetaDataFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain4*, DXGI_HDR_METADATA_TYPE, UINT, void*);
-// COM ABI slot of SetHDRMetaData: IUnknown 3 + IDXGIObject 4 + DeviceSubObject 1 + SwapChain 10
-// + SwapChain1 11 + SwapChain2 7 + SwapChain3 4 = 40.
-constexpr size_t SET_HDR_METADATA_VTABLE_INDEX = 40u;
-
-struct Record {
-  std::uint64_t call_count = 0u;
-  std::int64_t last_call_ms = 0;
-  DXGI_HDR_METADATA_TYPE type = DXGI_HDR_METADATA_TYPE_NONE;
-  std::optional<DXGI_HDR_METADATA_HDR10> hdr10 = std::nullopt;
-};
-
-std::mutex mutex;
-Record record;
-SetHdrMetaDataFn original = nullptr;
-void* target = nullptr;
-std::atomic_bool install_attempted = false;
-std::string install_error;
-
-HRESULT STDMETHODCALLTYPE Detour(IDXGISwapChain4* swapchain, DXGI_HDR_METADATA_TYPE type, UINT size, void* metadata) {
-  {
-    const std::scoped_lock lock(mutex);
-    ++record.call_count;
-    record.last_call_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                              std::chrono::system_clock::now().time_since_epoch())
-                              .count();
-    record.type = type;
-    if (type == DXGI_HDR_METADATA_TYPE_HDR10 && metadata != nullptr && size >= sizeof(DXGI_HDR_METADATA_HDR10)) {
-      record.hdr10 = *static_cast<const DXGI_HDR_METADATA_HDR10*>(metadata);
-    } else {
-      record.hdr10.reset();
-    }
-  }
-  return original(swapchain, type, size, metadata);
-}
-
-void InstallOnce(reshade::api::swapchain* swapchain) {
-  if (!renodx::utils::swapchain::IsDXGI(swapchain)) return;
-  if (install_attempted.exchange(true)) return;
-
-  auto* native = reinterpret_cast<IUnknown*>(swapchain->get_native());
-  IDXGISwapChain4* swapchain4 = nullptr;
-  if (native == nullptr || FAILED(native->QueryInterface(IID_PPV_ARGS(&swapchain4)))) {
-    const std::scoped_lock lock(mutex);
-    install_error = "IDXGISwapChain4 is not available";
-    return;
-  }
-  target = (*reinterpret_cast<void***>(swapchain4))[SET_HDR_METADATA_VTABLE_INDEX];
-  swapchain4->Release();
-
-  try {
-    const auto status = MH_Initialize();
-    if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED) {
-      throw std::runtime_error(MH_StatusToString(status));
-    }
-    const auto function = renodx::utils::minhook::Function(
-        reinterpret_cast<SetHdrMetaDataFn>(target), &Detour, &original);
-    renodx::utils::minhook::Create(function);
-    renodx::utils::minhook::Enable(function);
-  } catch (const std::exception& ex) {
-    const std::scoped_lock lock(mutex);
-    install_error = ex.what();
-    target = nullptr;
-  }
-}
-
-void Uninstall() {
-  // Redirect future calls before the module unloads; the detour lives in this DLL.
-  if (target != nullptr) {
-    MH_DisableHook(target);
-    MH_RemoveHook(target);
-    target = nullptr;
-  }
-}
-
-[[nodiscard]] json ToJson() {
-  const std::scoped_lock lock(mutex);
-  json result = {
-      {"hooked", target != nullptr},
-      {"hookError", install_error.empty() ? json(nullptr) : json(install_error)},
-      {"callCount", record.call_count},
-      {"lastCallMs", record.call_count == 0u ? json(nullptr) : json(record.last_call_ms)},
-      {"type", "none"},
-  };
-  if (record.type == DXGI_HDR_METADATA_TYPE_HDR10) result["type"] = "hdr10";
-  if (record.type == DXGI_HDR_METADATA_TYPE_HDR10PLUS) result["type"] = "hdr10plus";
-  if (record.hdr10.has_value()) {
-    const auto& m = record.hdr10.value();
-    // DXGI units: chromaticities in 1/50000, MaxMasteringLuminance in nits, MinMasteringLuminance in 1/10000 nits.
-    const auto xy = [](const UINT16 values[2]) { return json{values[0] / 50000.0, values[1] / 50000.0}; };
-    result["hdr10"] = {
-        {"redPrimary", xy(m.RedPrimary)},
-        {"greenPrimary", xy(m.GreenPrimary)},
-        {"bluePrimary", xy(m.BluePrimary)},
-        {"whitePoint", xy(m.WhitePoint)},
-        {"maxMasteringLuminanceNits", m.MaxMasteringLuminance},
-        {"minMasteringLuminanceNits", m.MinMasteringLuminance / 10000.0},
-        {"maxContentLightLevel", m.MaxContentLightLevel},
-        {"maxFrameAverageLightLevel", m.MaxFrameAverageLightLevel},
-    };
-  }
-  return result;
-}
-}  // namespace hdr_metadata_hook
-
-constexpr std::int64_t OUTPUT_DESC_REFRESH_MS = 2000;
-
-// previous: the last cached info for this swapchain; its display state is reused until it is OUTPUT_DESC_REFRESH_MS old.
-[[nodiscard]] DeviceData::CachedSwapchainRuntimeInfo CaptureSwapchainRuntimeInfo(
-    reshade::api::swapchain* swapchain,
-    const DeviceData::CachedSwapchainRuntimeInfo* previous = nullptr) {
-  DeviceData::CachedSwapchainRuntimeInfo info = {};
-  if (swapchain == nullptr) return info;
-  info.color_space = swapchain->get_color_space();
-  info.current_backbuffer_index = swapchain->get_current_back_buffer_index();
-  const auto bb_count = swapchain->get_back_buffer_count();
-  info.backbuffer_handles.reserve(bb_count);
-  for (uint32_t i = 0u; i < bb_count; ++i) {
-    const auto bb = swapchain->get_back_buffer(i);
-    if (bb.handle != 0u) {
-      info.backbuffer_handles.push_back(bb.handle);
-    }
-  }
-
-  const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                          std::chrono::steady_clock::now().time_since_epoch())
-                          .count();
-  if (previous != nullptr && previous->output_desc_queried_ms != 0
-      && now_ms - previous->output_desc_queried_ms < OUTPUT_DESC_REFRESH_MS) {
-    info.output_desc = previous->output_desc;
-    info.output_desc_queried_ms = previous->output_desc_queried_ms;
-  } else {
-    if (renodx::utils::swapchain::IsDXGI(swapchain)) {
-      info.output_desc = renodx::utils::swapchain::GetDirectXOutputDesc1(swapchain);
-    }
-    info.output_desc_queried_ms = now_ms;
-  }
-  return info;
-}
-
 void OnInitSwapchain(reshade::api::swapchain* swapchain, bool resize) {
   auto* device = swapchain->get_device();
   if (renodx::utils::device_proxy::IsCreatingProxyDevice()
@@ -6232,12 +4400,9 @@ void OnInitSwapchain(reshade::api::swapchain* swapchain, bool resize) {
   }
 
   const bool is_flip = IsFlipSwapchainPresentMode(tracked_desc.present_mode);
-  hdr_metadata_hook::InstallOnce(swapchain);
-  auto runtime_info = CaptureSwapchainRuntimeInfo(swapchain);
   {
     const std::unique_lock lock(device_data->mutex);
     device_data->swapchain_descs[swapchain] = tracked_desc;
-    device_data->swapchain_runtime_info[swapchain] = std::move(runtime_info);
     device_data->swapchain_windows[swapchain] = hwnd;
     if (!resize || device_data->primary_swapchain == nullptr || device_data->primary_swapchain == swapchain) {
       device_data->primary_swapchain = swapchain;
@@ -6264,7 +4429,6 @@ void OnDestroySwapchain(reshade::api::swapchain* swapchain, bool resize) {
   {
     const std::unique_lock<std::shared_mutex> lock(device_data->mutex);
     device_data->swapchain_descs.erase(swapchain);
-    device_data->swapchain_runtime_info.erase(swapchain);
     device_data->swapchain_windows.erase(swapchain);
     if (!resize && device_data->primary_swapchain == swapchain) {
       device_data->primary_swapchain = nullptr;
@@ -6562,35 +4726,6 @@ void OnDestroyResource(reshade::api::device* device, reshade::api::resource reso
   data->preview_srvs.erase(pair);
 }
 
-void OnPushConstants(
-    reshade::api::command_list* cmd_list,
-    reshade::api::shader_stage stages,
-    reshade::api::pipeline_layout layout,
-    uint32_t layout_param,
-    uint32_t first,
-    uint32_t count,
-    const void* values) {
-  (void)stages;
-  (void)layout;
-  if (cmd_list->get_device() != snapshot_device) return;
-  if (count == 0u || values == nullptr) return;
-  auto* data = renodx::utils::data::Get<CommandListData>(cmd_list);
-  if (data == nullptr) return;
-
-  const auto* src = static_cast<const uint32_t*>(values);
-  for (auto& existing : data->push_constants) {
-    if (existing.layout_param == layout_param && existing.first == first) {
-      existing.values.assign(src, src + count);
-      return;
-    }
-  }
-  data->push_constants.push_back(devkit_deep_analysis::PushConstantRecord{
-      .layout_param = layout_param,
-      .first = first,
-      .values = std::vector<uint32_t>(src, src + count),
-  });
-}
-
 void OnPushDescriptors(
     reshade::api::command_list* cmd_list,
     reshade::api::shader_stage stages,
@@ -6746,7 +4881,7 @@ void OnPushDescriptors(
   }
 }
 
-bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_method, uint32_t element_count = 0u) {
+bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_method) {
   bool bypass_draw = false;
 
   auto* device = cmd_list->get_device();
@@ -6848,7 +4983,6 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
     draw_details.cmd_list_handle = reinterpret_cast<uint64_t>(cmd_list);
     draw_details.cmd_list_draw_index = command_list_data->draw_counter++;
     draw_details.constants = command_list_data->constants;
-    draw_details.push_constants = command_list_data->push_constants;
     // draw_details.pipeline_binds = command_list_data->pipeline_binds;
     if (draw_method == DrawDetails::DrawMethods::DISPATCH) {
       draw_details.srv_binds = command_list_data->compute_srv_binds;
@@ -6858,8 +4992,6 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
       draw_details.uav_binds = command_list_data->pixel_uav_binds;
     }
     draw_details.blend_desc = command_list_data->blend_desc;
-    draw_details.viewport = command_list_data->viewport;
-    draw_details.element_count = element_count;
 
     std::unique_lock lock(device_data->mutex);
     struct CachedResourceViewDetails {
@@ -6928,12 +5060,8 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
             ? reshade::api::pipeline_stage::compute_shader
             : reshade::api::pipeline_stage::pixel_shader);
     if (bound_pipeline.handle != 0u) {
-      std::optional<reshade::api::pipeline_layout> pipeline_layout = std::nullopt;
-      renodx::utils::shader::GetPipelineShaderDetails(bound_pipeline, [&pipeline_layout](const auto& details) {
-        pipeline_layout = details.layout;
-      });
-      draw_details.descriptor_tracking_status = "pipeline_details_missing";
-      if (pipeline_layout.has_value()) {
+      auto* pipeline_shader_details = renodx::utils::shader::GetPipelineShaderDetails(bound_pipeline);
+      if (pipeline_shader_details != nullptr) {
         const auto descriptor_table_state = renodx::utils::state::CopyBoundDescriptorTables(
             cmd_list,
             draw_method == DrawDetails::DrawMethods::DISPATCH
@@ -6942,26 +5070,12 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
         if (!descriptor_table_state.has_value()) return false;
         const auto& bound_pipeline_layout = descriptor_table_state->layout;
         const auto& bound_descriptor_tables = descriptor_table_state->tables;
-        // Vulkan accepts compatible but distinct layouts, so a differing handle does not stop the lookup.
-        draw_details.descriptor_tracking_status = (bound_pipeline_layout == pipeline_layout.value() ? "ok" : "ok_layout_handle_differs");
-        {
+        if (bound_pipeline_layout == pipeline_shader_details->layout) {
           const bool has_reflected_resource_binds = draw_details.resource_binds.has_value() && !draw_details.resource_binds->empty();
           auto* descriptor_data = renodx::utils::data::Get<renodx::utils::descriptor::DeviceData>(device);
           if (descriptor_data == nullptr) return false;
 
-          struct DescriptorTrackingCounters {
-            uint32_t params = 0u;
-            uint32_t params_without_table = 0u;
-            uint32_t ranges = 0u;
-            uint32_t heap_unknown = 0u;
-            uint32_t offset_invalid = 0u;
-            uint32_t candidates = 0u;
-            uint32_t not_a_view = 0u;
-            uint32_t resolved = 0u;
-            // First descriptor that was not a resource view: its type, heap offset, heap size and heap handle.
-            std::optional<std::string> first_not_a_view = std::nullopt;
-          } counters;
-          const bool layout_data_found = renodx::utils::pipeline_layout::GetPipelineLayoutData(pipeline_layout.value(), [&](const auto& local_layout_data) {
+          renodx::utils::pipeline_layout::GetPipelineLayoutData(pipeline_shader_details->layout, [&](const auto& local_layout_data) {
             const auto& info = *local_layout_data;
             auto param_count = info.params.size();
 
@@ -6970,8 +5084,6 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
 
               const auto& param = info.params.at(param_index);
               const auto& table = bound_descriptor_tables[param_index];
-              ++counters.params;
-              if (table.handle == 0u) ++counters.params_without_table;
 
               uint32_t descriptor_table_count;
               const reshade::api::descriptor_range* descriptor_table_ranges;
@@ -7020,7 +5132,6 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
                   continue;
                 }
 
-                ++counters.ranges;
                 uint32_t base_offset = 0;
                 reshade::api::descriptor_heap heap = {0};
                 device->get_descriptor_heap_offset(table, range.binding, 0, &heap, &base_offset);
@@ -7028,13 +5139,11 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
                 auto heap_pair = descriptor_data->heaps.find(heap.handle);
                 if (heap_pair == descriptor_data->heaps.end()) {
                   // Unknown heap?
-                  ++counters.heap_unknown;
                   continue;
                 }
                 const auto& heap_data = heap_pair->second;
                 if (base_offset >= heap_data.size()) {
                   // Invalid location (may be oversized bind)
-                  ++counters.offset_invalid;
                   continue;
                 }
                 const auto available_descriptor_count = static_cast<uint32_t>(heap_data.size() - base_offset);
@@ -7099,7 +5208,6 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
                 }
 
                 const bool use_uav = range_bind_type == ResourceBind::BindType::UAV;
-                counters.candidates += static_cast<uint32_t>(candidate_slots.size());
 
                 for (const auto& candidate : candidate_slots) {
                   const auto offset = base_offset + candidate.index;
@@ -7117,13 +5225,6 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
                   }
 
                   if (!descriptor.HasResourceView()) {
-                    ++counters.not_a_view;
-                    if (!counters.first_not_a_view.has_value()) {
-                      counters.first_not_a_view = std::format(
-                          "type={} offset={} heap_size={} heap=0x{:X} table=0x{:X} range_binding={} range_type={}",
-                          static_cast<uint32_t>(descriptor.type), offset, heap_data.size(), heap.handle, table.handle,
-                          range.binding, static_cast<uint32_t>(range.type));
-                    }
                     if (use_uav) {
                       draw_details.uav_binds.erase(slot);
                     } else {
@@ -7136,7 +5237,6 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
                   if (resource_view.handle != 0u) {
                     auto& cached = get_cached_resource_view_details(resource_view);
                     if (cached.details.resource.handle != 0u || !is_cached_resource_view_empty(cached, resource_view)) {
-                      ++counters.resolved;
                       if (use_uav) {
                         draw_details.uav_binds[slot] = cached.details;
                       } else {
@@ -7155,12 +5255,6 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
               }
             }
           });
-          draw_details.descriptor_tracking_status = std::format(
-              "{} layout_data={} params={} params_without_table={} ranges={} heap_unknown={} offset_invalid={} candidates={} "
-              "not_a_view={} resolved={} first_not_a_view=[{}]",
-              draw_details.descriptor_tracking_status, layout_data_found, counters.params, counters.params_without_table,
-              counters.ranges, counters.heap_unknown, counters.offset_invalid, counters.candidates, counters.not_a_view,
-              counters.resolved, counters.first_not_a_view.value_or("none"));
         }
       }
     }
@@ -7236,14 +5330,7 @@ bool OnDraw(
     uint32_t instance_count,
     uint32_t first_vertex,
     uint32_t first_instance) {
-  return OnDraw(cmd_list, DrawDetails::DrawMethods::DRAW, vertex_count);
-}
-
-void OnBindViewports(reshade::api::command_list* cmd_list, uint32_t first, uint32_t count, const reshade::api::viewport* viewports) {
-  if (first != 0u || count == 0u || viewports == nullptr) return;
-  if (auto* data = renodx::utils::data::Get<CommandListData>(cmd_list); data != nullptr) {
-    data->viewport = viewports[0];
-  }
+  return OnDraw(cmd_list, DrawDetails::DrawMethods::DRAW);
 }
 
 bool OnDispatch(reshade::api::command_list* cmd_list, uint32_t group_count_x, uint32_t group_count_y, uint32_t group_count_z) {
@@ -7257,7 +5344,7 @@ bool OnDrawIndexed(
     uint32_t first_index,
     int32_t vertex_offset,
     uint32_t first_instance) {
-  return OnDraw(cmd_list, DrawDetails::DrawMethods::DRAW_INDEXED, index_count);
+  return OnDraw(cmd_list, DrawDetails::DrawMethods::DRAW_INDEXED);
 }
 
 bool OnDrawOrDispatchIndirect(
@@ -7360,23 +5447,6 @@ bool RenderFileAlias(std::optional<renodx::utils::shader::compiler::watcher::Cus
 
 void RenderMenuBar(reshade::api::device* device, DeviceData* data) {
   if (ImGui::BeginMenuBar()) {
-    const bool is_tracking_active = devkit_tracking_active.load();
-    ImGui::PushID("##DevKitActiveToggle");
-    ImGui::PushStyleColor(
-        ImGuiCol_Text,
-        is_tracking_active ? ImVec4(0.35f, 0.95f, 0.45f, 1.0f) : ImVec4(1.0f, 0.65f, 0.25f, 1.0f));
-    if (ImGui::MenuItem(is_tracking_active ? "DevKit: Active" : "DevKit: Idle")) {
-      bypass_forced_tracking.store(false);
-      devkit_tracking_requested.store(!is_tracking_active);
-    }
-    ImGui::PopStyleColor();
-    ImGui::SetItemTooltip(
-        "%s",
-        is_tracking_active
-            ? "Hot-path tracking hooks are active. Click to switch to Idle (low-overhead) mode."
-            : "DevKit is in Idle (low-overhead) mode. Click to enable hot-path tracking hooks.");
-    ImGui::PopID();
-
     ImGui::PushID("##SnapshotButton");
     ImGui::BeginDisabled(snapshot_device != nullptr);
     if (ImGui::MenuItem("Snapshot")) {
@@ -7416,7 +5486,6 @@ void RenderMenuBar(reshade::api::device* device, DeviceData* data) {
 
     ImGui::PushID("##TraceButton");
     if (ImGui::MenuItem("Trace")) {
-      devkit_tracking_requested.store(true);
       renodx::utils::trace::trace_scheduled_device = device;
     }
     ImGui::PopID();
@@ -9205,7 +7274,8 @@ void RenderShadersPane(reshade::api::device* device, DeviceData* data) {
                           })
                           + (ImGui::GetStyle().FramePadding.x * 2);
         if (ImGui::Button("Draw", {text_size, 0})) {
-          SetShaderDrawBypass(*shader_details, !shader_details->bypass_draw);
+          shader_details->bypass_draw = !shader_details->bypass_draw;
+          skip_draw_count += shader_details->bypass_draw ? +1 : -1;
         }
         ImGui::PopStyleColor();
 
@@ -9821,13 +7891,6 @@ struct SettingsDeviceOption {
   }
 
   if (BeginSettingsSection("Other")) {
-    DrawSettingBoolCheckbox("Start Active on Launch", "StartActive", &setting_devkit_start_active);
-    const bool previous_keep_descriptor = setting_keep_descriptor_tracking_in_idle.load();
-    DrawSettingBoolCheckbox("Keep Descriptor Tracking in Idle", "KeepDescriptorTrackingInIdle", &setting_keep_descriptor_tracking_in_idle);
-    if (setting_keep_descriptor_tracking_in_idle.load() != previous_keep_descriptor) {
-      renodx::utils::descriptor::SetTraceDescriptorTables(
-          devkit_tracking_active.load() || setting_keep_descriptor_tracking_in_idle.load());
-    }
     DrawSettingDecimalTextbox("FPS Limit", "FPSLimit", &renodx::utils::swapchain::fps_limit);
 
     EndSettingsSection();
@@ -10605,13 +8668,7 @@ void RenderResourceView(reshade::api::device* device, DeviceData* data, SettingS
 }
 
 void RenderConstantBufferViewPreview(reshade::api::device* device, DeviceData* data, uint64_t constant_buffer_handle) {
-  // The handle comes from a snapshot and may be freed by now; never query the API with it.
-  reshade::api::resource_desc details = {};
-  if (constant_buffer_handle == 0u
-      || !renodx::utils::resource::GetLiveResourceInfo({constant_buffer_handle}, [&details](const auto& info) { details = info.desc; })) {
-    ImGui::TextDisabled("Constant buffer was destroyed since the snapshot.");
-    return;
-  }
+  auto details = device->get_resource_desc({constant_buffer_handle});
 
   if (details.type == reshade::api::resource_type::buffer) {
     auto data = renodx::utils::constants::GetResourceCache(device, {constant_buffer_handle});
@@ -10791,8 +8848,6 @@ void InitializeUserSettings() {
   }
 
   for (const auto& [key, value] : std::vector<std::pair<const char*, std::atomic_bool*>>({
-           {"StartActive", &setting_devkit_start_active},
-           {"KeepDescriptorTrackingInIdle", &setting_keep_descriptor_tracking_in_idle},
            {"TraceAll", &renodx::utils::trace::trace_all},
            {"TracePipelineCreation", &renodx::utils::trace::trace_pipeline_creation},
            {"TraceDescriptorTables", &renodx::utils::descriptor::trace_descriptor_tables},
@@ -11093,61 +9148,6 @@ void OnExecuteCommandList(
   device_data->draw_detail_indexes_by_cmd_list.erase(index_pair);
 }
 
-void SetDevkitTrackingActive(bool active) {
-  std::unique_lock lock(devkit_tracking_mutex);
-  if (devkit_tracking_active.load() == active) return;
-
-  if (active) {
-    reshade::register_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
-    reshade::register_event<reshade::addon_event::copy_resource>(OnCopyResource);
-    reshade::register_event<reshade::addon_event::copy_texture_region>(OnCopyTextureRegion);
-    reshade::register_event<reshade::addon_event::push_constants>(OnPushConstants);
-    reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
-    reshade::register_event<reshade::addon_event::bind_viewports>(OnBindViewports);
-    reshade::register_event<reshade::addon_event::draw>(OnDraw);
-    reshade::register_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
-    reshade::register_event<reshade::addon_event::draw_or_dispatch_indirect>(OnDrawOrDispatchIndirect);
-    reshade::register_event<reshade::addon_event::dispatch>(OnDispatch);
-    reshade::register_event<reshade::addon_event::execute_command_list>(OnExecuteCommandList);
-  } else {
-    snapshot_device = nullptr;
-    snapshot_queued_device = nullptr;
-    renodx::utils::trace::trace_scheduled_device = nullptr;
-    reshade::unregister_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
-    reshade::unregister_event<reshade::addon_event::copy_resource>(OnCopyResource);
-    reshade::unregister_event<reshade::addon_event::copy_texture_region>(OnCopyTextureRegion);
-    reshade::unregister_event<reshade::addon_event::push_constants>(OnPushConstants);
-    reshade::unregister_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
-    reshade::unregister_event<reshade::addon_event::bind_viewports>(OnBindViewports);
-    reshade::unregister_event<reshade::addon_event::draw>(OnDraw);
-    reshade::unregister_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
-    reshade::unregister_event<reshade::addon_event::draw_or_dispatch_indirect>(OnDrawOrDispatchIndirect);
-    reshade::unregister_event<reshade::addon_event::dispatch>(OnDispatch);
-    reshade::unregister_event<reshade::addon_event::execute_command_list>(OnExecuteCommandList);
-  }
-
-  renodx::utils::state::SetHotPathEventsEnabled(active);
-  renodx::utils::trace::SetEventsEnabled(active);
-  renodx::utils::descriptor::SetTraceDescriptorTables(
-      active || setting_keep_descriptor_tracking_in_idle.load());
-  renodx::utils::constants::SetCaptureEnabled(
-      active && renodx::utils::constants::capture_constant_buffers.load(),
-      active && renodx::utils::constants::capture_push_descriptors.load());
-  renodx::utils::swapchain::SetRenderPassEventsEnabled(active);
-  renodx::utils::resource::replace::SetEnabled(active);
-  if (!active) {
-    snapshot_return_to_idle.store(false);
-    trace_return_to_idle.store(false);
-  }
-
-  devkit_tracking_active.store(active);
-  devkit_tracking_requested.store(active);
-
-  reshade::log::message(
-      reshade::log::level::info,
-      active ? "devkit(Hot-path tracking enabled)" : "devkit(Hot-path tracking disabled - Idle mode)");
-}
-
 void OnPresent(
     reshade::api::command_queue* queue,
     reshade::api::swapchain* swapchain,
@@ -11157,25 +9157,6 @@ void OnPresent(
     const reshade::api::rect* dirty_rects) {
   auto* device = swapchain->get_device();
   if (renodx::utils::device_proxy::IsProxyDevice(device)) return;
-
-  if (snapshot_queued_device != nullptr || renodx::utils::trace::trace_scheduled_device != nullptr) {
-    devkit_tracking_requested.store(true);
-  }
-  if (trace_return_to_idle.load()
-      && renodx::utils::trace::trace_scheduled_device == nullptr
-      && renodx::utils::trace::trace_running_device == nullptr
-      && snapshot_device == nullptr
-      && snapshot_queued_device == nullptr) {
-    trace_return_to_idle.store(false);
-    if (skip_draw_count.load() == 0u) {
-      devkit_tracking_requested.store(false);
-    } else {
-      bypass_forced_tracking.store(true);  // return to Idle once the last bypass goes away
-    }
-  }
-  if (const bool requested = devkit_tracking_requested.load(); requested != devkit_tracking_active.load()) {
-    SetDevkitTrackingActive(requested);
-  }
 
   DeviceData* data = renodx::utils::data::Get<DeviceData>(device);
   if (data == nullptr) return;
@@ -11195,20 +9176,9 @@ void OnPresent(
         device_index = static_cast<uint32_t>(std::distance(device_data_list.begin(), iterator));
       }
     }
-    // Copy the previous entry out so no DXGI call runs under device_data->mutex (see the ABBA deadlock fix).
-    std::optional<DeviceData::CachedSwapchainRuntimeInfo> previous_runtime_info;
-    {
-      std::shared_lock device_lock(device_data->mutex);
-      if (const auto it = device_data->swapchain_runtime_info.find(swapchain); it != device_data->swapchain_runtime_info.end()) {
-        previous_runtime_info = it->second;
-      }
-    }
-    auto swapchain_runtime_info = CaptureSwapchainRuntimeInfo(
-        swapchain, previous_runtime_info.has_value() ? &previous_runtime_info.value() : nullptr);
     std::deque<std::shared_ptr<devkit_resource_analysis::PendingRequest>> pending_requests;
     {
       std::unique_lock device_lock(device_data->mutex);
-      device_data->swapchain_runtime_info[swapchain] = std::move(swapchain_runtime_info);
       pending_requests.swap(device_data->pending_resource_analysis_requests);
     }
     devkit_resource_analysis::ProcessPendingRequests(
@@ -11220,31 +9190,7 @@ void OnPresent(
             .format_handle = [](uint64_t value) { return FormatHandle(value); },
             .format_format = [](reshade::api::format format) { return StreamToString(format); },
             .build_resource_view_summary = [](reshade::api::resource_view resource_view, reshade::api::device* device) { return BuildResourceViewSummary(GetResourceViewDetails(resource_view, device)); },
-            .is_hdr10_pq_backbuffer = [device_data](reshade::api::device*, reshade::api::resource resource) {
-              std::shared_lock device_lock(device_data->mutex);
-              return std::ranges::any_of(device_data->swapchain_runtime_info, [resource](const auto& entry) {
-                const auto& [swapchain_ptr, rt_info] = entry;
-                (void)swapchain_ptr;
-                return rt_info.color_space == reshade::api::color_space::hdr10_st2084
-                       && std::ranges::find(rt_info.backbuffer_handles, resource.handle) != rt_info.backbuffer_handles.end();
-              });
-            },
-            .suspend_live_shaders = SuspendLiveShadersForAb,
-            .restore_live_shaders = RestoreLiveShadersForAb,
-            .requeue_request = [](uint32_t idx, const std::shared_ptr<devkit_resource_analysis::PendingRequest>& req) {
-              (void)EnqueuePendingResourceAnalysisRequest(idx, req);
-            },
         });
-
-    std::deque<std::shared_ptr<devkit_deep_analysis::PendingConstantsRequest>> pending_constants;
-    {
-      std::unique_lock device_lock(device_data->mutex);
-      pending_constants.swap(device_data->pending_constants_requests);
-    }
-    devkit_deep_analysis::ProcessPendingConstantsRequests(
-        pending_constants,
-        device_data->device,
-        queue);
 
     std::deque<std::shared_ptr<PendingLiveShaderRequest>> pending_live_shader_requests;
     {
@@ -11253,16 +9199,6 @@ void OnPresent(
     }
     ProcessPendingLiveShaderRequests(
         pending_live_shader_requests,
-        device_index,
-        device_data);
-
-    std::deque<std::shared_ptr<devkit_device_proxy::PendingDeviceProxyRequest>> pending_device_proxy_requests;
-    {
-      std::unique_lock device_lock(device_data->mutex);
-      pending_device_proxy_requests.swap(device_data->pending_device_proxy_requests);
-    }
-    ProcessPendingDeviceProxyRequests(
-        pending_device_proxy_requests,
         device_index,
         device_data);
   }
@@ -11313,47 +9249,26 @@ void OnPresent(
     renodx::utils::shader::dump::DumpAllPending();
   }
 
-  // The caller must hold device_data->mutex
-  const auto reset_snapshot_capture = [](DeviceData* device_data) {
-    device_data->draw_details_list.clear();
-    device_data->draw_detail_indexes_by_cmd_list.clear();
-    device_data->resource_usage_by_handle.clear();
-    device_data->snapshot_rows.clear();
-    device_data->snapshot_row_layout_key = 0u;
-    ++device_data->snapshot_rows_generation;
-    device_data->snapshot_rows_valid = false;
-    snapshot_submission_counter.store(0u, std::memory_order_relaxed);
-  };
-
   reshade::api::device* active_snapshot_device = snapshot_device;
   if (active_snapshot_device == nullptr) {
     if (snapshot_queued_device == device) {
       auto* device_data = get_data();
       std::unique_lock lock(device_data->mutex);
-      reset_snapshot_capture(device_data);
+      device_data->draw_details_list.clear();
+      device_data->draw_detail_indexes_by_cmd_list.clear();
+      device_data->resource_usage_by_handle.clear();
+      device_data->snapshot_rows.clear();
+      device_data->snapshot_row_layout_key = 0u;
+      ++device_data->snapshot_rows_generation;
+      device_data->snapshot_rows_valid = false;
+      snapshot_submission_counter.store(0u, std::memory_order_relaxed);
       snapshot_device = device;
       snapshot_queued_device = nullptr;
     }
   } else if (device == active_snapshot_device) {
-    {
-      // With frame generation, presents alternate between rendered and generated frames. A window that starts on the
-      // wrong present holds no rendering, so capture the next window instead of keeping it
-      auto* device_data = get_data();
-      std::unique_lock lock(device_data->mutex);
-      if (device_data->draw_details_list.size() < MIN_SNAPSHOT_DRAW_COUNT && snapshot_retry_count < MAX_SNAPSHOT_RETRIES) {
-        ++snapshot_retry_count;
-        reset_snapshot_capture(device_data);
-        return;
-      }
-      snapshot_retry_count = 0u;
-    }
     snapshot_device = nullptr;
     auto* device_data = get_data();
     std::unique_lock lock(device_data->mutex);
-    ++device_data->snapshot_capture_count;
-    device_data->snapshot_captured_at_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                               std::chrono::system_clock::now().time_since_epoch())
-                                               .count();
     std::ranges::sort(device_data->draw_details_list, [](const DrawDetails& a, const DrawDetails& b) {
       const bool a_unknown_submission = a.submission_order == 0u;
       const bool b_unknown_submission = b.submission_order == 0u;
@@ -11397,16 +9312,6 @@ void OnPresent(
     device_data->snapshot_rows.clear();
     device_data->snapshot_row_layout_key = 0u;
     device_data->snapshot_rows_valid = false;
-    lock.unlock();
-    // Active bypasses need the draw hooks; stay active until the last one is removed.
-    if (snapshot_return_to_idle.exchange(false)) {
-      if (skip_draw_count.load() == 0u) {
-        devkit_tracking_requested.store(false);
-        SetDevkitTrackingActive(false);
-      } else {
-        bypass_forced_tracking.store(true);  // return to Idle once the last bypass goes away
-      }
-    }
   }
 }
 
@@ -11431,23 +9336,20 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       }
 
       renodx::utils::shader::use_shader_cache = true;
-      renodx::utils::trace::register_events_on_attach = false;
       renodx::utils::trace::Use(fdw_reason);
       renodx::utils::constants::Use(fdw_reason);
       renodx::utils::descriptor::Use(fdw_reason);
       renodx::utils::state::use_pipeline_tracking = true;
       renodx::utils::state::use_descriptor_tables = true;
-      renodx::utils::state::enable_hot_path_events_on_attach = false;
       renodx::utils::state::Use(fdw_reason);
       renodx::utils::pipeline_layout::Use(fdw_reason);
       renodx::utils::shader::Use(fdw_reason);
       renodx::utils::shader::dump::Use(fdw_reason);
-      renodx::utils::swapchain::enable_render_pass_events_on_attach = false;
       renodx::utils::swapchain::Use(fdw_reason);
       renodx::utils::device_upgrade::Use(fdw_reason);
       renodx::utils::device_proxy::Use(fdw_reason);
       renodx::utils::resource::replace::Use(fdw_reason);
-      renodx::utils::resource::replace::SetEnabled(false);
+      renodx::utils::resource::replace::SetEnabled(true);
       renodx::utils::resource::replace::SetProvider(LoadBootTextureReplacement);
       renodx::utils::resource::Use(fdw_reason);
 
@@ -11458,26 +9360,28 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::register_event<reshade::addon_event::reset_command_list>(OnResetCommandList);
       reshade::register_event<reshade::addon_event::init_pipeline>(OnInitPipelineTrackAddons);
       reshade::register_event<reshade::addon_event::init_pipeline>(OnInitPipeline);
+      reshade::register_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
       reshade::register_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipeline);
+      reshade::register_event<reshade::addon_event::copy_resource>(OnCopyResource);
+      reshade::register_event<reshade::addon_event::copy_texture_region>(OnCopyTextureRegion);
       reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
 
+      reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
+      reshade::register_event<reshade::addon_event::draw>(OnDraw);
+      reshade::register_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
+      reshade::register_event<reshade::addon_event::draw_or_dispatch_indirect>(OnDrawOrDispatchIndirect);
+      reshade::register_event<reshade::addon_event::dispatch>(OnDispatch);
       reshade::register_event<reshade::addon_event::present>(OnPresent);
+      reshade::register_event<reshade::addon_event::execute_command_list>(OnExecuteCommandList);
       reshade::register_event<reshade::addon_event::create_swapchain>(OnCreateSwapchain);
       reshade::register_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
       reshade::register_event<reshade::addon_event::destroy_swapchain>(OnDestroySwapchain);
-
-      renodx::utils::descriptor::SetTraceDescriptorTables(
-          setting_devkit_start_active.load() || setting_keep_descriptor_tracking_in_idle.load());
-      renodx::utils::constants::SetCaptureEnabled(false, false);
-      SetDevkitTrackingActive(setting_devkit_start_active.load());
 
       reshade::register_overlay("RenoDX DevKit", OnRegisterOverlay);
 
       break;
     case DLL_PROCESS_DETACH:
       devkit_mcp_server_session::Stop(devkit_mcp_session);
-      SetDevkitTrackingActive(false);
-      hdr_metadata_hook::Uninstall();
 
       renodx::utils::trace::Use(fdw_reason);
       renodx::utils::constants::Use(fdw_reason);
@@ -11499,13 +9403,21 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::unregister_event<reshade::addon_event::init_command_list>(OnInitCommandList);
       reshade::unregister_event<reshade::addon_event::destroy_command_list>(OnDestroyCommandList);
       reshade::unregister_event<reshade::addon_event::reset_command_list>(OnResetCommandList);
-      reshade::unregister_event<reshade::addon_event::init_pipeline>(OnInitPipelineTrackAddons);
       reshade::unregister_event<reshade::addon_event::init_pipeline>(OnInitPipeline);
+      reshade::unregister_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
       reshade::unregister_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipeline);
+      reshade::unregister_event<reshade::addon_event::copy_resource>(OnCopyResource);
+      reshade::unregister_event<reshade::addon_event::copy_texture_region>(OnCopyTextureRegion);
       reshade::unregister_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
       reshade::unregister_event<reshade::addon_event::create_swapchain>(OnCreateSwapchain);
+      reshade::unregister_event<reshade::addon_event::dispatch>(OnDispatch);
+      reshade::unregister_event<reshade::addon_event::execute_command_list>(OnExecuteCommandList);
       reshade::unregister_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
       reshade::unregister_event<reshade::addon_event::destroy_swapchain>(OnDestroySwapchain);
+      reshade::unregister_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
+      reshade::unregister_event<reshade::addon_event::draw>(OnDraw);
+      reshade::unregister_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
+      reshade::unregister_event<reshade::addon_event::draw_or_dispatch_indirect>(OnDrawOrDispatchIndirect);
       reshade::unregister_overlay("RenoDX DevKit", OnRegisterOverlay);
 
       break;
